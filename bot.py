@@ -30,17 +30,28 @@ UPGRADE_PREF = ["gun_damage", "laser_damage", "gun_rate", "laser_charge", "light
 FIGHT_MOVE = False     # duel/strafe instead of fleeing when healthy; False = old flee movement, still shoots more
 STRAFE_W = 0.8         # strafing strength while dueling (0 = hold position, ~1.5 = jink hard)
 # below this HP fraction an upgrade offer picks survival first, otherwise damage first
-LOW_HP_PICK = 0.55
+# v5: 0.0 = never survival-first, i.e. the same damage-first picks as hunter-v2 (2.38), so the only change vs v2 is farming.
+# Set back to 0.55 to restore v4's HP-aware picks.
+LOW_HP_PICK = 0.0
 UPGRADE_SURVIVE_FIRST = ["nanites", "plating", "armor", "gun_damage", "laser_damage", "gun_rate",
                          "laser_charge", "lightning_efficiency", "servos", "gyros", "sensors", "reactor",
                          "capacitor", "lightning_chain", "lightning_range", "gun_mag", "gun_velocity", "jets",
                          "mortar_splash", "mortar_reload", "mortar_velocity", "laser_pierce"]
+# --- crate farming (v5): when calm and healthy, walk to nearby crates and shoot them (1 cube + 50% weapon each) ---
+FARM_CRATES = True     # False = behave exactly like v4 (no crate cache, no crate shooting, no speed change)
+FARM_RANGE = 70.0      # only consider crates this close (m)
+FARM_STANDOFF = 18.0   # stop walking this far from the crate (pitch limit stops us aiming down at close range)
+FARM_FIRE_RANGE = 40.0 # shoot the crate from at most this far (m), needs clear line
+FARM_SPEED = 1.0       # walk speed (fraction of walk_speed) to crates and cubes; footsteps only carry 40 m
+FARM_MIN_HP = 0.85     # only farm when at least this healthy (shooting crates may pause regen, so heal first)
+FARM_MAX_T = 300.0     # stop farming after this match time (s)
+FARM_GIVEUP_S = 30.0   # give up on one crate after this long (unreachable / stuck)
 LOOT_VALUE = {"laser": 3.0, "lightning": 2.5, "mortar": 1.5}
 LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
 
 
 class Bot:
-    name = "hunter-v4"
+    name = "hunter-v5"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -68,6 +79,13 @@ class Bot:
         self.hop_start = -1.0
         self.stuck_n = 0
         self.fighting = False
+        # crate farming state
+        self.crates = {}           # id -> [x, y, z, misses]; obs only lists crates while we see them
+        self.crate_id = None       # crate we are currently working on
+        self.crate_since = 0.0
+        self.crate_bad = set()     # crates we gave up on (unreachable, NPC nearby)
+        self.farm = None           # this tick's crate target (or None)
+        self.farm_firing = False   # this tick we are in firing posture at a crate (blocks early reload)
 
     # ------------------------------------------------------------------ helpers
     def _pick_upgrade(self, offer, hpf=1.0):
@@ -150,11 +168,20 @@ class Bot:
         if obs.get("offer"):
             act["pick"] = self._pick_upgrade(obs["offer"], me["hp"] / max(1.0, me["max_hp"]))
 
+        self.farm = None
+        self.farm_firing = False
+        if FARM_CRATES:
+            self._update_crates(obs, x, y)
+
         for ev in obs["events"]:
             if ev["type"] == "damaged" and ev.get("by") is not None:
                 self.last_dmg_t = t
                 self.last_attacker = ev["by"]
                 self.last_dmg_bearing = ev.get("bearing")
+                if FARM_CRATES and ev["by"] >= 100:   # NPC drone: write off crates around here
+                    for cid, ce in self.crates.items():
+                        if math.hypot(ce[0] - x, ce[1] - y) < 70.0:
+                            self.crate_bad.add(cid)
         hot = (t - self.last_dmg_t) < 2.5
 
         zi = self._zone(obs, x, y)
@@ -204,7 +231,11 @@ class Bot:
         # ---- loot ----
         loot = None
         if not danger and not urgent and not (late and t > 300):
-            loot = self._find_loot(obs, me, x, y, z, thr)
+            farm_ok = (FARM_CRATES and not go and hpf >= FARM_MIN_HP and t < FARM_MAX_T and
+                       any(w and w["kind"] == "gun" for w in me["weapons"]))
+            loot = self._find_loot(obs, me, x, y, z, thr, zi, farm_ok)
+        if loot is not None and loot.get("crate"):
+            self.farm = loot
 
         # ---- movement decision ----
         goal = zi["goal"] if (urgent or go) else None
@@ -233,6 +264,8 @@ class Bot:
             speed = sneak
         if late:
             speed = 1.0
+        if FARM_CRATES and loot is not None and not loot.get("is_weapon") and not caution and not (urgent or go):
+            speed = FARM_SPEED
 
         # ---- hop: jump + jet over walls when we are walled in or stuck and must leave ----
         hop = False
@@ -275,6 +308,11 @@ class Bot:
                     ux, uy = tgt
                     move = (ux * sneak, uy * sneak)
                     self.hx, self.hy = ux, uy
+
+        if self.farm is not None and not hop:
+            fx, fy = self.farm["pos"][0], self.farm["pos"][1]
+            if math.hypot(fx - x, fy - y) <= FARM_STANDOFF and not W.blocked(x, y, fx, fy):
+                move = (0.0, 0.0)
 
         # stuck handling
         self.hist.append((t, x, y))
@@ -321,7 +359,7 @@ class Bot:
         return act
 
     # ------------------------------------------------------------------ loot
-    def _find_loot(self, obs, me, x, y, z, thr):
+    def _find_loot(self, obs, me, x, y, z, thr, zi=None, farm_ok=False):
         threats_near = any(e["d"] < 100 and not e.get("sound") for e in thr)
         if threats_near:
             return None
@@ -346,7 +384,70 @@ class Bot:
                     sc = 1.0 / (10.0 + d)
                     if sc > bs:
                         bs, best = sc, {"id": c["id"], "pos": c["pos"], "is_weapon": False}
+        if best is None and farm_ok and zi is not None:
+            best = self._pick_crate(obs, x, y, z, obs["t"], thr, zi)
         return best
+
+    # ------------------------------------------------------------------ crate farming
+    def _update_crates(self, obs, x, y):
+        """Remember crates (obs lists them only while visible); forget ones that are gone."""
+        seen = set()
+        for c in obs.get("crates") or []:
+            p = c["pos"]
+            self.crates[c["id"]] = [p[0], p[1], p[2], 0]
+            seen.add(c["id"])
+        W = self.world
+        for cid in list(self.crates):
+            if cid in seen:
+                continue
+            e = self.crates[cid]
+            # close, in plain sight, yet not listed -> destroyed (needs 3 misses in a row: trunks can hide one)
+            if math.hypot(e[0] - x, e[1] - y) < 25.0 and not W.blocked(x, y, e[0], e[1]):
+                e[3] += 1
+                if e[3] >= 3:
+                    del self.crates[cid]
+            else:
+                e[3] = 0
+
+    def _pick_crate(self, obs, x, y, z, t, thr, zi):
+        """Nearest worthwhile crate, or None. Sticks to the current crate so we don't dither."""
+        if not self.crates:
+            return None
+        for e in thr:   # heard gunfire (soft threat) or a mech anywhere near: not the time to farm
+            if e["d"] <= (110.0 if e.get("sound") else 150.0):
+                return None
+        c, r = (zi["c0"], zi["r0"]) if t < zi["s"] - 25.0 else (zi["c"], zi["r"])
+        npcs = [m["pos"] for m in obs["mechs"] if m.get("kind") == "npc"]
+        W = self.world
+        best, bd = None, 1e9
+        for cid, e in self.crates.items():
+            if cid in self.crate_bad:
+                continue
+            cx, cy, cz = e[0], e[1], e[2]
+            d = math.hypot(cx - x, cy - y)
+            if d > FARM_RANGE or abs(cz - z) > 3.0:
+                continue
+            if math.hypot(cx - c[0], cy - c[1]) > r - 25.0:   # keep clear of the zone edge
+                continue
+            if W.is_solid(cx, cy):                             # on a roof / inside a building
+                continue
+            if any(math.hypot(cx - n[0], cy - n[1]) < 50.0 for n in npcs):   # drone would keep shooting us
+                continue
+            if cid == self.crate_id:
+                d -= 15.0
+            if d < bd:
+                best, bd = cid, d
+        if best is None:
+            self.crate_id = None
+            return None
+        if best != self.crate_id:
+            self.crate_id, self.crate_since = best, t
+        elif t - self.crate_since > FARM_GIVEUP_S:
+            self.crate_bad.add(best)
+            self.crate_id = None
+            return None
+        e = self.crates[best]
+        return {"id": best, "pos": (e[0], e[1], e[2]), "is_weapon": False, "crate": True}
 
     # ------------------------------------------------------------------ movement
     def _choose_heading(self, x, y, z, thr, zi, gdir, w_goal, urgent, t):
@@ -495,6 +596,28 @@ class Bot:
             return None
         return dx / d, dy / d
 
+    def _farm_aim(self, me, ws, x, y, z, mh, stats, cur_yaw, cur_pitch, fire):
+        """Aim the gun at the crate we are farming and fire when lined up. Returns [yaw, pitch] or None."""
+        gi = None
+        for i, w in enumerate(ws):
+            if w and w["kind"] == "gun":
+                gi = i
+        if gi is None:
+            return None
+        cx, cy, cz = self.farm["pos"]
+        d = math.hypot(cx - x, cy - y)
+        if d > FARM_FIRE_RANGE or self.world.blocked(x, y, cx, cy):
+            return None
+        pitch = math.atan2(cz + 1.2 - (z + mh), max(d, 1.0))      # crate is 2.4 m tall: aim at its middle
+        pitch = max(stats.get("min_pitch", -0.7), min(stats.get("max_pitch", 1.3), pitch))
+        yaw = math.atan2(cy - y, cx - x)
+        g = ws[gi]
+        if g.get("ammo", 1) > 0:
+            self.farm_firing = True          # in firing posture: don't start an early reload
+            if g.get("reload", 0.0) <= 0 and abs(wrap(yaw - cur_yaw)) < 0.05 and abs(pitch - cur_pitch) < 0.08:
+                fire[gi] = True
+        return [yaw, pitch]
+
     # ------------------------------------------------------------------ combat
     def _combat(self, act, obs, me, x, y, z, t, thr, vis, hot, late, zi, move):
         stats = me.get("stats") or {}
@@ -594,6 +717,9 @@ class Bot:
         if laser_slot is not None and ws[laser_slot].get("charge", 0.0) > 0 and not fire[laser_slot] and aim is None:
             fire[laser_slot] = False
 
+        if FARM_CRATES and aim is None and tgt is None and self.farm is not None:
+            aim = self._farm_aim(me, ws, x, y, z, mh, stats, cur_yaw, cur_pitch, fire)
+
         if aim is None:
             if tgt is not None:   # have a target but holding fire: still face it (front armor)
                 aim = [math.atan2(tgt["y"] - y, tgt["x"] - x), 0.0]
@@ -612,7 +738,8 @@ class Bot:
         g = ws[0] if ws and ws[0] and ws[0]["kind"] == "gun" else None
         if g is not None:
             mag = g.get("stats", {}).get("mag", 12)
-            if g.get("reload", 0.0) <= 0 and (g.get("ammo", mag) <= 0 or (not vis and g.get("ammo", mag) < mag)):
+            if g.get("reload", 0.0) <= 0 and (g.get("ammo", mag) <= 0 or
+                                              (not vis and g.get("ammo", mag) < mag and not self.farm_firing)):
                 reload = True
         act["reload"] = reload
 
