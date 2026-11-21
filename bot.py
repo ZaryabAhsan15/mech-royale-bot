@@ -29,12 +29,18 @@ UPGRADE_PREF = ["gun_damage", "laser_damage", "gun_rate", "laser_charge", "light
 # Tuning switches (change these if a submission scores worse than expected)
 FIGHT_MOVE = False     # duel/strafe instead of fleeing when healthy; False = old flee movement, still shoots more
 STRAFE_W = 0.8         # strafing strength while dueling (0 = hold position, ~1.5 = jink hard)
+# below this HP fraction an upgrade offer picks survival first, otherwise damage first
+LOW_HP_PICK = 0.55
+UPGRADE_SURVIVE_FIRST = ["nanites", "plating", "armor", "gun_damage", "laser_damage", "gun_rate",
+                         "laser_charge", "lightning_efficiency", "servos", "gyros", "sensors", "reactor",
+                         "capacitor", "lightning_chain", "lightning_range", "gun_mag", "gun_velocity", "jets",
+                         "mortar_splash", "mortar_reload", "mortar_velocity", "laser_pierce"]
 LOOT_VALUE = {"laser": 3.0, "lightning": 2.5, "mortar": 1.5}
 LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
 
 
 class Bot:
-    name = "hunter-v3"
+    name = "hunter-v4"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -64,11 +70,13 @@ class Bot:
         self.fighting = False
 
     # ------------------------------------------------------------------ helpers
-    def _pick_upgrade(self, offer):
+    def _pick_upgrade(self, offer, hpf=1.0):
+        """Hurt -> take a survival upgrade first; healthy -> take damage first."""
+        pref = UPGRADE_SURVIVE_FIRST if hpf < LOW_HP_PICK else UPGRADE_PREF
         best, bi = 999, 0
         for i, c in enumerate(offer["choices"]):
             try:
-                r = UPGRADE_PREF.index(c["id"])
+                r = pref.index(c["id"])
             except ValueError:
                 r = 500
             if r < best:
@@ -140,7 +148,7 @@ class Bot:
         walk = stats.get("walk_speed", 11.7)
 
         if obs.get("offer"):
-            act["pick"] = self._pick_upgrade(obs["offer"])
+            act["pick"] = self._pick_upgrade(obs["offer"], me["hp"] / max(1.0, me["max_hp"]))
 
         for ev in obs["events"]:
             if ev["type"] == "damaged" and ev.get("by") is not None:
@@ -197,10 +205,6 @@ class Bot:
         loot = None
         if not danger and not urgent and not (late and t > 300):
             loot = self._find_loot(obs, me, x, y, z, thr)
-        if not danger and not urgent and t < 330:
-            drop = self._find_drop(obs, me, x, y)
-            if drop is not None:
-                loot = drop
 
         # ---- movement decision ----
         goal = zi["goal"] if (urgent or go) else None
@@ -228,8 +232,6 @@ class Bot:
         elif caution and speed < 1.0:
             speed = sneak
         if late:
-            speed = 1.0
-        if loot is not None and loot.get("drop") and math.hypot(loot["pos"][0] - x, loot["pos"][1] - y) > 40.0:
             speed = 1.0
 
         # ---- hop: jump + jet over walls when we are walled in or stuck and must leave ----
@@ -274,11 +276,6 @@ class Bot:
                     move = (ux * sneak, uy * sneak)
                     self.hx, self.hy = ux, uy
 
-        # sit inside a landed supply drop's ring (alone for ~4 s = full HP/energy + cubes)
-        if loot is not None and loot.get("drop") and not hop and \
-                math.hypot(loot["pos"][0] - x, loot["pos"][1] - y) < loot["radius"] - 3.0:
-            move = (0.0, 0.0)
-
         # stuck handling
         self.hist.append((t, x, y))
         while self.hist and t - self.hist[0][0] > 2.5:
@@ -318,8 +315,6 @@ class Bot:
             lx, ly = loot["pos"][0], loot["pos"][1]
             if math.hypot(lx - x, ly - y) < self.cfg["loot"]["pickup_radius"] - 0.6 and loot.get("is_weapon"):
                 act["take"] = loot["id"]
-                if loot.get("swap"):
-                    act["drop"] = 1
                 self.dead_loot.add(loot["id"])  # don't retry forever if it fails
 
         mf.draw.label(f"{'URG ' if urgent else ''}{'GO ' if go else ''}{'DNG ' if danger else ''}hp{me['hp']:.0f} v{len(vis)}")
@@ -332,22 +327,18 @@ class Bot:
             return None
         slots = me["weapons"]
         best, bs = None, 0.0
-        cur = slots[1] if len(slots) > 1 else None
-        cur_v = LOOT_VALUE.get(cur["kind"], 0.0) if cur else 0.0
-        if len(slots) > 1:
+        if len(slots) > 1 and slots[1] is None:
             have = {w["kind"] for w in slots if w}
             for p in obs["pickups"]:
                 k = p["kind"]
                 if k == "gun" or k in have or p["id"] in self.dead_loot or k not in LOOT_VALUE:
                     continue
-                if cur is not None and LOOT_VALUE[k] < cur_v + 0.6:
-                    continue   # only swap the second slot for a clearly better weapon
                 d = math.hypot(p["pos"][0] - x, p["pos"][1] - y)
                 if d > LOOT_RANGE[k] or abs(p["pos"][2] - z) > 3.0:
                     continue
                 sc = LOOT_VALUE[k] / (10.0 + d)
                 if sc > bs:
-                    bs, best = sc, {"id": p["id"], "pos": p["pos"], "is_weapon": True, "swap": cur is not None}
+                    bs, best = sc, {"id": p["id"], "pos": p["pos"], "is_weapon": True}
         if best is None and obs["t"] < 330:
             for c in obs["cubes"]:
                 d = math.hypot(c["pos"][0] - x, c["pos"][1] - y)
@@ -408,25 +399,6 @@ class Bot:
                 d = max(1e-6, e["d"])
                 return (x - e["x"]) / d, (y - e["y"]) / d
             return self.hx, self.hy
-        return best
-
-    def _find_drop(self, obs, me, x, y):
-        """Nearest supply drop we can reach about when it lands and that nobody else is capturing."""
-        walk = (me.get("stats") or self.cfg["mech"]).get("walk_speed", 11.7)
-        best, bd = None, 1e9
-        for d in obs.get("drops") or []:
-            h = d.get("holder")
-            if h is not None and h != me["id"]:
-                continue
-            px, py = d["pos"][0], d["pos"][1]
-            dist = math.hypot(px - x, py - y)
-            lands = d.get("lands_in", 0.0)
-            if dist > 220.0 or lands > dist / walk + 8.0:
-                continue
-            if dist < bd:
-                bd = dist
-                best = {"id": d["id"], "pos": d["pos"], "is_weapon": False, "drop": True,
-                        "radius": d.get("radius", 8.0)}
         return best
 
     def _pick_target(self, vis, hot):
