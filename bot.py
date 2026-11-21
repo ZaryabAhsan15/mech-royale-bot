@@ -21,16 +21,20 @@ def wrap(a):
     return (a + PI) % TAU - PI
 
 
-UPGRADE_PREF = ["armor", "plating", "nanites", "servos", "gyros", "sensors", "reactor", "capacitor",
-                "gun_damage", "gun_rate", "laser_damage", "laser_charge", "lightning_efficiency",
+UPGRADE_PREF = ["gun_damage", "laser_damage", "gun_rate", "laser_charge", "lightning_efficiency",
+                "armor", "plating", "nanites",
+                "servos", "gyros", "sensors", "reactor", "capacitor",
                 "lightning_chain", "lightning_range", "gun_mag", "gun_velocity", "jets",
                 "mortar_splash", "mortar_reload", "mortar_velocity", "laser_pierce"]
+# Tuning switches (change these if a submission scores worse than expected)
+FIGHT_MOVE = False     # duel/strafe instead of fleeing when healthy; False = old flee movement, still shoots more
+STRAFE_W = 0.8         # strafing strength while dueling (0 = hold position, ~1.5 = jink hard)
 LOOT_VALUE = {"laser": 3.0, "lightning": 2.5, "mortar": 1.5}
-LOOT_RANGE = {"laser": 90.0, "lightning": 70.0, "mortar": 45.0}
+LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
 
 
 class Bot:
-    name = "survivor-v1"
+    name = "hunter-v2"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -57,6 +61,7 @@ class Bot:
         self.hop_until = -1.0      # while t < hop_until: jump + jet over walls toward the goal
         self.hop_start = -1.0
         self.stuck_n = 0
+        self.fighting = False
 
     # ------------------------------------------------------------------ helpers
     def _pick_upgrade(self, offer):
@@ -102,8 +107,9 @@ class Bot:
         if self.flow_goal is None or math.hypot(goal[0] - self.flow_goal[0], goal[1] - self.flow_goal[1]) > 25.0:
             if self.pending is None or math.hypot(goal[0] - self.pending.gx, goal[1] - self.pending.gy) > 25.0:
                 self.pending = Flow(self.world, goal[0], goal[1])
-        if self.pending is not None and time.perf_counter() - t0 < 0.02:
-            self.pending.step(1500)
+        if self.pending is not None and time.perf_counter() - t0 < 0.010:
+            while not self.pending.done and time.perf_counter() - t0 < 0.010:
+                self.pending.step(150)
             if self.pending.done:
                 self.flow, self.pending = self.pending, None
                 self.flow_goal = (self.flow.gx, self.flow.gy)
@@ -179,6 +185,14 @@ class Bot:
         caution = danger or any(e["d"] < 130 for e in thr)
         nearest_vis = min(vis, key=lambda e: e["d"]) if vis else None
 
+        # ---- fight or flee: duel when healthy and not swarmed, otherwise fall back to evasion ----
+        hpf = me["hp"] / max(1.0, me["max_hp"])
+        ftgt = self._pick_target(vis, hot)
+        n_close = sum(1 for e in vis if e["d"] < 110.0)
+        fight = (FIGHT_MOVE and ftgt is not None and ftgt["d"] < 170.0 and not urgent and not go and
+                 hpf > (0.40 if self.fighting is False else 0.28) and (n_close <= 2 or hpf > 0.75))
+        self.fighting = fight
+
         # ---- loot ----
         loot = None
         if not danger and not urgent and not (late and t > 300):
@@ -235,17 +249,24 @@ class Bot:
             move = (gdir[0], gdir[1])
             self.hx, self.hy = gdir
             speed = 1.0
+        elif fight:
+            ux, uy = self._fight_heading(x, y, z, ftgt, thr, zi, t, self._pref_range(me, ftgt))
+            move = (ux, uy)
+            self.hx, self.hy = ux, uy
+            speed = 1.0
         elif danger or urgent or go or loot is not None or caution:
             ux, uy = self._choose_heading(x, y, z, thr, zi, gdir, w_goal, urgent, t)
             move = (ux * speed, uy * speed)
             self.hx, self.hy = ux, uy
         else:
             # calm and safe: look for cover, otherwise hold still (silent)
-            tgt = self._cover_move(x, y, t, zi, thr)
-            if tgt is not None:
-                ux, uy = tgt
-                move = (ux * sneak, uy * sneak)
-                self.hx, self.hy = ux, uy
+            # skip cover search if we are already over budget
+            if time.perf_counter() - t0 < 0.020:
+                tgt = self._cover_move(x, y, t, zi, thr)
+                if tgt is not None:
+                    ux, uy = tgt
+                    move = (ux * sneak, uy * sneak)
+                    self.hx, self.hy = ux, uy
 
         # stuck handling
         self.hist.append((t, x, y))
@@ -313,7 +334,7 @@ class Bot:
         if best is None and obs["t"] < 330:
             for c in obs["cubes"]:
                 d = math.hypot(c["pos"][0] - x, c["pos"][1] - y)
-                if d <= 28 and abs(c["pos"][2] - z) <= 3.0:
+                if d <= 40 and abs(c["pos"][2] - z) <= 3.0:
                     sc = 1.0 / (10.0 + d)
                     if sc > bs:
                         bs, best = sc, {"id": c["id"], "pos": c["pos"], "is_weapon": False}
@@ -328,7 +349,7 @@ class Bot:
         if t < zi["s"] - 25.0:
             sc_c, sr = zi["c0"], zi["r0"]
         L = 16.0
-        near_thr = [e for e in thr if e["d"] < 230][:6]
+        near_thr = [e for e in thr if e["d"] < 230][:4]
         cur = near_thr[:1]
         if t > self.strafe_until:
             self.strafe_sign = self.rng.choice((-1, 1))
@@ -370,6 +391,67 @@ class Bot:
                 d = max(1e-6, e["d"])
                 return (x - e["x"]) / d, (y - e["y"]) / d
             return self.hx, self.hy
+        return best
+
+    def _pick_target(self, vis, hot):
+        """Finish weak enemies first; always answer whoever is shooting us if they are close."""
+        if not vis:
+            return None
+        if hot:
+            for e in vis:
+                if e["id"] == self.last_attacker and e["d"] < 60.0:
+                    return e
+        return min(vis, key=lambda e: e["hp"] + 10.0 * e["d"])
+
+    def _pref_range(self, me, tgt):
+        """Distance we want to fight at, from what we carry and what the target carries."""
+        mine = {w["kind"] for w in me["weapons"] if w}
+        theirs = set((tgt.get("m") or {}).get("weapons") or [])
+        if "lightning" in mine and me["energy"] >= 15 and "mortar" not in theirs:
+            return 32.0
+        if "laser" in mine and "lightning" not in theirs:
+            return 85.0
+        if "mortar" in mine and "laser" not in theirs and tgt["d"] > 60.0:
+            return 90.0
+        return 60.0
+
+    def _fight_heading(self, x, y, z, tgt, thr, zi, t, pref):
+        """Strafe around the target at our preferred range, inside the zone, away from its friends."""
+        W = self.world
+        sc_c, sr = zi["c"], zi["r"]
+        if t < zi["s"] - 25.0:
+            sc_c, sr = zi["c0"], zi["r0"]
+        if t > self.strafe_until:
+            self.strafe_sign = self.rng.choice((-1, 1))
+            self.strafe_until = t + self.rng.uniform(0.8, 1.8)
+        b = math.atan2(tgt["y"] - y, tgt["x"] - x)
+        others = [e for e in thr if e is not tgt and not e.get("sound") and e["d"] < 160.0][:3]
+        L = 12.0
+        best, bsc = None, -1e9
+        for k in range(16):
+            a = k * TAU / 16
+            ux, uy = math.cos(a), math.sin(a)
+            if not W.path_clear(x, y, ux, uy, L, z):
+                continue
+            px, py = x + ux * L, y + uy * L
+            sc = 0.0
+            dd = math.hypot(px - sc_c[0], py - sc_c[1]) - (sr - 12.0)
+            if dd > 0:
+                sc -= dd * 0.6
+            sc -= abs(math.hypot(px - tgt["x"], py - tgt["y"]) - pref) / 12.0
+            sc += STRAFE_W * self.strafe_sign * (-math.sin(b) * ux + math.cos(b) * uy)
+            sc += 0.3 * (ux * self.hx + uy * self.hy)
+            for e in others:
+                d1 = math.hypot(px - e["x"], py - e["y"])
+                if d1 < e["d"]:
+                    sc -= 0.6 * (e["d"] - d1) / L
+                if d1 < 80.0 and W.blocked(px, py, e["x"], e["y"]):
+                    sc += 0.8
+            if sc > bsc:
+                bsc, best = sc, (ux, uy)
+        if best is None:
+            d = max(1e-6, tgt["d"])
+            return -(tgt["y"] - y) / d, (tgt["x"] - x) / d   # sidestep
         return best
 
     def _cover_move(self, x, y, t, zi, thr):
@@ -416,16 +498,13 @@ class Bot:
         reload = False
 
         # choose a target
-        tgt = None
-        if vis:
-            def key(e):
-                return (0 if (hot and e["id"] == self.last_attacker) else 1, e["d"])
-            tgt = min(vis, key=key)
+        tgt = self._pick_target(vis, hot)
 
         want = False
         if tgt is not None:
+            hpf = me["hp"] / max(1.0, me["max_hp"])
             want = (hot or tgt["d"] <= 75.0 or late or obs["alive"] <= 5 or
-                    (tgt["pct"] <= 0.35 and tgt["d"] <= 120.0))
+                    (tgt["pct"] <= 0.35 and tgt["d"] <= 120.0) or hpf > 0.40)
 
         # laser mid-charge: must keep deciding about it even without a target
         laser_slot = None
