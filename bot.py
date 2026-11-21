@@ -27,7 +27,7 @@ UPGRADE_PREF = ["gun_damage", "laser_damage", "gun_rate", "laser_charge", "light
                 "lightning_chain", "lightning_range", "gun_mag", "gun_velocity", "jets",
                 "mortar_splash", "mortar_reload", "mortar_velocity", "laser_pierce"]
 # Tuning switches (change these if a submission scores worse than expected)
-FIGHT_MOVE = False     # duel/strafe instead of fleeing when healthy; False = old flee movement, still shoots more
+FIGHT_MOVE = True     # duel/strafe instead of fleeing when healthy; False = old flee movement, still shoots more
 STRAFE_W = 0.8         # strafing strength while dueling (0 = hold position, ~1.5 = jink hard)
 LOOT_VALUE = {"laser": 3.0, "lightning": 2.5, "mortar": 1.5}
 LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
