@@ -76,14 +76,14 @@ OPENING_S = 8.0
 LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
 
 # Snowballing: only sweep a victim's nearby drops briefly after a confirmed kill.
-SNOWBALL_KILL_WINDOW = 7.0      # was 4.5 (2.69 bot)
-SNOWBALL_LOOT_RADIUS = 32.0      # was 24.0
-SNOWBALL_MIN_ENEMY_DISTANCE = 60.0   # was 68.0
+SNOWBALL_KILL_WINDOW = 4.5
+SNOWBALL_LOOT_RADIUS = 24.0
+SNOWBALL_MIN_ENEMY_DISTANCE = 68.0
 SNOWBALL_MIN_HP_FRACTION = 0.50
 
 
 class Bot:
-    name = "snowball-v13"
+    name = "hunter-snowball-v14"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -124,6 +124,8 @@ class Bot:
         self.last_kill_t = -999.0
         self.last_kill_id = None
         self.last_kill_pos = None
+        self.sound_focus_bearing = None
+        self.sound_focus_until = -1.0
 
     # ------------------------------------------------------------------ helpers
     def _pick_upgrade(self, offer, hpf=1.0):
@@ -237,6 +239,19 @@ class Bot:
                 self.last_kill_pos = (
                     self.focus_pos if self.focus_id == self.last_kill_id else None
                 )
+        # A laser charge is audible within 140 m. When no mech is visible,
+        # briefly turn the vision wedge toward that bearing to acquire the shooter.
+        # This never fires blindly and does not change movement or target scoring.
+        for sound in obs.get("sounds") or []:
+            if (sound.get("kind") == "laser_charge" and
+                    sound.get("age", 99.0) < 0.9 and
+                    sound.get("dist") in ("near", "mid")):
+                age = max(0.0, float(sound.get("age", 0.0)))
+                until = t + max(0.1, 1.1 - age)
+                if until >= self.sound_focus_until:
+                    self.sound_focus_bearing = wrap(float(sound["bearing"]))
+                    self.sound_focus_until = until
+
         hot = (t - self.last_dmg_t) < 2.5
 
         zi = self._zone(obs, x, y)
@@ -546,7 +561,7 @@ class Bot:
                 d = math.hypot(px - x, py - y)
                 if d > SNOWBALL_LOOT_RADIUS or abs(pz - z) > 3.0:
                     continue
-                if kill_pos is not None and math.hypot(px - kill_pos[0], py - kill_pos[1]) > 40.0:
+                if kill_pos is not None and math.hypot(px - kill_pos[0], py - kill_pos[1]) > 32.0:
                     continue
                 score = weapon_value[kind] / (8.0 + d)
                 if score > best_score:
@@ -559,7 +574,7 @@ class Bot:
             d = math.hypot(px - x, py - y)
             if d > SNOWBALL_LOOT_RADIUS or abs(pz - z) > 3.0:
                 continue
-            if kill_pos is not None and math.hypot(px - kill_pos[0], py - kill_pos[1]) > 40.0:
+            if kill_pos is not None and math.hypot(px - kill_pos[0], py - kill_pos[1]) > 32.0:
                 continue
             score = 2.4 / (8.0 + d)
             if score > best_score:
@@ -964,6 +979,9 @@ class Bot:
                 aim = [math.atan2(tgt["y"] - y, tgt["x"] - x), 0.0]
             elif hot and self.last_dmg_bearing is not None:
                 aim = [self.last_dmg_bearing, 0.0]
+            elif (self.sound_focus_bearing is not None and
+                  t <= self.sound_focus_until):
+                aim = [self.sound_focus_bearing, 0.0]
             elif thr and not thr[0].get("sound") and thr[0]["d"] < 160:
                 aim = [math.atan2(thr[0]["y"] - y, thr[0]["x"] - x), 0.0]
             elif math.hypot(*move) > 0.05:
