@@ -76,14 +76,14 @@ OPENING_S = 8.0
 LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
 
 # Snowballing: only sweep a victim's nearby drops briefly after a confirmed kill.
-SNOWBALL_KILL_WINDOW = 4.5
-SNOWBALL_LOOT_RADIUS = 24.0
-SNOWBALL_MIN_ENEMY_DISTANCE = 68.0
+SNOWBALL_KILL_WINDOW = 7.0      # was 4.5 (2.69 bot)
+SNOWBALL_LOOT_RADIUS = 32.0      # was 24.0
+SNOWBALL_MIN_ENEMY_DISTANCE = 60.0   # was 68.0
 SNOWBALL_MIN_HP_FRACTION = 0.50
 
 
 class Bot:
-    name = "hunter-snowball-v13-range-gated"
+    name = "snowball-v13"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -546,7 +546,7 @@ class Bot:
                 d = math.hypot(px - x, py - y)
                 if d > SNOWBALL_LOOT_RADIUS or abs(pz - z) > 3.0:
                     continue
-                if kill_pos is not None and math.hypot(px - kill_pos[0], py - kill_pos[1]) > 32.0:
+                if kill_pos is not None and math.hypot(px - kill_pos[0], py - kill_pos[1]) > 40.0:
                     continue
                 score = weapon_value[kind] / (8.0 + d)
                 if score > best_score:
@@ -559,7 +559,7 @@ class Bot:
             d = math.hypot(px - x, py - y)
             if d > SNOWBALL_LOOT_RADIUS or abs(pz - z) > 3.0:
                 continue
-            if kill_pos is not None and math.hypot(px - kill_pos[0], py - kill_pos[1]) > 32.0:
+            if kill_pos is not None and math.hypot(px - kill_pos[0], py - kill_pos[1]) > 40.0:
                 continue
             score = 2.4 / (8.0 + d)
             if score > best_score:
@@ -734,37 +734,21 @@ class Bot:
         return best
 
     def _weapon_edge(self, me, tgt):
-        """Only treat lightning as a duel advantage when its laser counter is usable now."""
-        mine = {w["kind"]: w for w in me["weapons"] if w}
+        """Original v9 duel trigger retained to isolate the snowball experiment."""
+        mine = {w["kind"] for w in me["weapons"] if w}
         theirs = set((tgt.get("m") or {}).get("weapons") or [])
-
-        # Lightning is not a long-range answer to a laser: only close when the
-        # target is actually inside lightning range, visible, and not carrying
-        # mortar (which counters lightning).
-        lightning = mine.get("lightning")
-        if (lightning is not None and "laser" in theirs and "mortar" not in theirs
-                and me.get("energy", 0.0) >= 15.0 and tgt.get("los", False)):
-            lr = lightning.get("stats", {}).get("range", 45.0)
-            if tgt.get("d", 1e9) <= lr - 4.0:
-                return True
-
-        # Preserve the proven baseline's laser engagement rule unchanged.
+        if "lightning" in mine and me["energy"] >= 15 and "mortar" not in theirs:
+            return True
         if "laser" in mine and "lightning" not in theirs:
             return True
         return False
 
     def _pref_range(self, me, tgt):
-        """Use close lightning range only when a visible laser can be interrupted."""
-        mine = {w["kind"]: w for w in me["weapons"] if w}
+        """Original preferred engagement ranges retained for a controlled experiment."""
+        mine = {w["kind"] for w in me["weapons"] if w}
         theirs = set((tgt.get("m") or {}).get("weapons") or [])
-
-        lightning = mine.get("lightning")
-        if (lightning is not None and "laser" in theirs and "mortar" not in theirs
-                and me.get("energy", 0.0) >= 15.0 and tgt.get("los", False)):
-            lr = lightning.get("stats", {}).get("range", 45.0)
-            if tgt.get("d", 1e9) <= lr - 4.0:
-                return 32.0
-
+        if "lightning" in mine and me["energy"] >= 15 and "mortar" not in theirs:
+            return 32.0
         if "laser" in mine and "lightning" not in theirs:
             return 85.0
         if "mortar" in mine and "laser" not in theirs and tgt["d"] > 60.0:
