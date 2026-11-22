@@ -1,4 +1,4 @@
-"""Early-kill snowball bot for mechfight/1 (Mech Royale) — v16 rear-arc targeting.
+"""Early-kill snowball bot for mechfight/1 (Mech Royale).
 
 Based on the bot source supplied in the conversation. It preserves the original
 zone navigation, quiet movement, cover seeking, crate handling, weapon rush,
@@ -9,8 +9,9 @@ a healthy distant laser carrier when a more practical kill is available.
 2. After a confirmed kill, briefly collect nearby cubes and a dropped special
 weapon only when nearby enemies cannot immediately contest the loot.
 
-This is an experimental strategy build. Local syntax/helper tests do not establish
-that it scores better, and the official conformance check/scorer has not been run.
+This experimental build adds conditional mortar splash targeting for visible enemy
+clusters. It preserves the established snowball baseline. Local tests do not establish
+that it scores better; the official conformance check/scorer has not been run.
 """
 import math
 import random
@@ -81,9 +82,20 @@ SNOWBALL_LOOT_RADIUS = 24.0
 SNOWBALL_MIN_ENEMY_DISTANCE = 68.0
 SNOWBALL_MIN_HP_FRACTION = 0.50
 
+# Multi-kill mortar support. This never changes movement or target selection;
+# it only substitutes a mortar shot when a visible cluster offers clearly
+# better combined value than an ordinary single-target mortar hit.
+MULTIKILL_ENABLED = True
+MULTIKILL_MIN_TARGETS = 2
+MULTIKILL_SPLASH_RADIUS = 7.0
+MULTIKILL_MAX_RANGE = 180.0
+MULTIKILL_MIN_RANGE = 38.0
+MULTIKILL_MAX_FLIGHT = 2.8
+MULTIKILL_MIN_SCORE = 260.0
+
 
 class Bot:
-    name = "hunter-snowball-v16"
+    name = "hunter-multikill"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -292,7 +304,7 @@ class Bot:
 
         # ---- fight or flee ----
         hpf = me["hp"] / max(1.0, me["max_hp"])
-        ftgt = self._pick_target(vis, hot, x, y)
+        ftgt = self._pick_target(vis, hot)
         n_close = sum(1 for e in vis if e["d"] < 110.0)
         fight = (
             ftgt is not None and
@@ -678,7 +690,7 @@ class Bot:
             return self.hx, self.hy
         return best
 
-    def _pick_target(self, vis, hot, my_x=None, my_y=None):
+    def _pick_target(self, vis, hot):
         """Prefer accessible early kills; avoid long chases after healthy laser holders."""
         if not vis:
             self.focus_id = None
@@ -716,16 +728,6 @@ class Bot:
             elif e.get("charging") and d > 45.0:
                 # Do not run toward an out-of-range charge just to duel it.
                 cost += 100.0
-
-            # Prefer an otherwise comparable target whose torso is turned away.
-            # Rear hits deal 1.5x damage; require a 20-degree margin beyond the
-            # 90-degree front-arc boundary to avoid chasing noisy/temporary angles.
-            enemy_aim = m.get("aim")
-            if my_x is not None and my_y is not None and enemy_aim:
-                bearing_from_enemy = math.atan2(my_y - e["y"], my_x - e["x"])
-                facing_error = abs(wrap(bearing_from_enemy - enemy_aim[0]))
-                if facing_error >= math.radians(110.0):
-                    cost -= 130.0
 
             # A weakened carrier with cubes is a valuable kill/drop opportunity.
             carried_cubes = max(0, int(m.get("cubes", 0) or 0))
@@ -860,6 +862,272 @@ class Bot:
                 fire[gi] = True
         return [yaw, pitch]
 
+    def _mortar_cluster_plan(self, me, x, y, z, vis):
+        """Find a high-value mortar splash point for multiple visible enemies.
+
+        This is deliberately fire-only: it does not steer the mech toward a
+        cluster. Candidate enemy positions are projected to mortar impact time,
+        and candidates blocked from the blast point are excluded.
+        """
+        if not MULTIKILL_ENABLED or len(vis) < MULTIKILL_MIN_TARGETS:
+            return None
+
+        weapons = me.get("weapons") or []
+        mortar_slot = None
+        mortar = None
+        for i, weapon in enumerate(weapons):
+            if weapon and weapon.get("kind") == "mortar":
+                mortar_slot, mortar = i, weapon
+                break
+        if mortar is None or mortar.get("cooldown", 0.0) > 0.05:
+            return None
+
+        # Do not turn away from a laser that we have already started charging.
+        for weapon in weapons:
+            if weapon and weapon.get("kind") == "laser" and weapon.get("charge", 0.0) > 0.0:
+                return None
+
+        # A ready, in-range lightning interrupt has priority over splash.
+        mine = self._weapon_map(me)
+        lightning = mine.get("lightning")
+        if lightning is not None and me.get("energy", 0.0) >= 3.0:
+            lr = lightning.get("stats", {}).get("range", 45.0)
+            for enemy in vis:
+                if (enemy.get("charging") and "laser" in enemy.get("weapons", set())
+                        and enemy.get("los") and enemy.get("d", 1e9) <= lr - 2.0):
+                    return None
+
+        wstats = mortar.get("stats") or {}
+        speed = float(wstats.get("speed", 72.0))
+        splash = float(wstats.get("splash", 160.0))
+        splash_radius = float(wstats.get("splash_radius", MULTIKILL_SPLASH_RADIUS))
+        gravity = float((self.cfg.get("weapons") or {}).get("mortar", {}).get("gravity", 22.0))
+        splash_radius = min(splash_radius, MULTIKILL_SPLASH_RADIUS)
+        if speed <= 1.0 or splash_radius <= 0.5 or gravity <= 0.0:
+            return None
+
+        mech_stats = me.get("stats") or {}
+        mortar_origin_z = z + float(mech_stats.get("height", 9.0)) + 0.5
+        targets = [e for e in vis if e.get("id") is not None and e.get("los")]
+        if len(targets) < MULTIKILL_MIN_TARGETS:
+            return None
+
+        def ballistic(dh, dz):
+            if dh < 1.0:
+                return None
+            v2 = speed * speed
+            disc = v2 * v2 - gravity * (gravity * dh * dh + 2.0 * dz * v2)
+            if disc < 0.0:
+                return None
+            tan_pitch = (v2 - math.sqrt(disc)) / (gravity * dh)
+            pitch = math.atan(tan_pitch)
+            cp = math.cos(pitch)
+            if cp <= 0.15:
+                return None
+            flight = dh / (speed * cp)
+            return pitch, flight
+
+        def predict_all(dt):
+            predicted = []
+            for enemy in targets:
+                ex = enemy["x"] + enemy.get("vx", 0.0) * dt
+                ey = enemy["y"] + enemy.get("vy", 0.0) * dt
+                ez = enemy["z"] + enemy.get("vz", 0.0) * dt + 4.5
+                predicted.append((enemy, ex, ey, ez))
+            return predicted
+
+        def collect_members(cx, cy, cz, predicted):
+            # Geometry only here. Wall checks are deferred until after the best
+            # cluster is selected, avoiding thousands of map queries in a crowd.
+            members = []
+            for enemy, ex, ey, ez in predicted:
+                r = math.sqrt((ex - cx) ** 2 + (ey - cy) ** 2 + (ez - cz) ** 2)
+                if r <= splash_radius:
+                    members.append((enemy, ex, ey, ez, r))
+            return members
+
+        best = None
+        best_score = MULTIKILL_MIN_SCORE
+        n = len(targets)
+
+        # Every pair seeds a possible cluster centre. With at most 15 mechs,
+        # this bounded O(n^3) scan is comfortably below the 50 ms budget.
+        for i in range(n):
+            for j in range(i + 1, n):
+                a, b = targets[i], targets[j]
+                seed_x = (a["x"] + b["x"]) * 0.5
+                seed_y = (a["y"] + b["y"]) * 0.5
+                seed_d = math.hypot(seed_x - x, seed_y - y)
+                if seed_d < MULTIKILL_MIN_RANGE or seed_d > MULTIKILL_MAX_RANGE:
+                    continue
+
+                # Low-arc flight-time initialisation, followed by a few fixed-
+                # point updates as the selected cluster moves.
+                dt = seed_d / max(20.0, speed * 0.82)
+                if dt > MULTIKILL_MAX_FLIGHT:
+                    continue
+                members = []
+                centre = None
+                pitch = None
+                flight = dt
+                for _ in range(3):
+                    predicted = predict_all(dt)
+                    pi, pj = predicted[i], predicted[j]
+                    cx = (pi[1] + pj[1]) * 0.5
+                    cy = (pi[2] + pj[2]) * 0.5
+                    cz = (pi[3] + pj[3]) * 0.5
+                    members = collect_members(cx, cy, cz, predicted)
+                    if len(members) < MULTIKILL_MIN_TARGETS:
+                        break
+                    cx = sum(m[1] for m in members) / len(members)
+                    cy = sum(m[2] for m in members) / len(members)
+                    cz = sum(m[3] for m in members) / len(members)
+                    # Recheck around the refined centre.
+                    members = collect_members(cx, cy, cz, predicted)
+                    if len(members) < MULTIKILL_MIN_TARGETS:
+                        break
+                    cx = sum(m[1] for m in members) / len(members)
+                    cy = sum(m[2] for m in members) / len(members)
+                    cz = sum(m[3] for m in members) / len(members)
+                    dh = math.hypot(cx - x, cy - y)
+                    if dh < MULTIKILL_MIN_RANGE or dh > MULTIKILL_MAX_RANGE:
+                        members = []
+                        break
+                    solution = ballistic(dh, cz - mortar_origin_z)
+                    if solution is None:
+                        members = []
+                        break
+                    pitch, flight = solution
+                    if flight > MULTIKILL_MAX_FLIGHT:
+                        members = []
+                        break
+                    centre = (cx, cy, cz)
+                    if abs(flight - dt) < 0.04:
+                        dt = flight
+                        break
+                    dt = flight
+
+                if len(members) < MULTIKILL_MIN_TARGETS or centre is None or pitch is None:
+                    continue
+
+                # Final evaluation at the converged approximate impact time.
+                predicted = predict_all(dt)
+                seed_i, seed_j = predicted[i], predicted[j]
+                cx = (seed_i[1] + seed_j[1]) * 0.5
+                cy = (seed_i[2] + seed_j[2]) * 0.5
+                cz = (seed_i[3] + seed_j[3]) * 0.5
+                members = collect_members(cx, cy, cz, predicted)
+                if len(members) < MULTIKILL_MIN_TARGETS:
+                    continue
+                cx = sum(m[1] for m in members) / len(members)
+                cy = sum(m[2] for m in members) / len(members)
+                cz = sum(m[3] for m in members) / len(members)
+                members = collect_members(cx, cy, cz, predicted)
+                if len(members) < MULTIKILL_MIN_TARGETS:
+                    continue
+                cx = sum(m[1] for m in members) / len(members)
+                cy = sum(m[2] for m in members) / len(members)
+                cz = sum(m[3] for m in members) / len(members)
+
+                dh = math.hypot(cx - x, cy - y)
+                if dh < MULTIKILL_MIN_RANGE or dh > MULTIKILL_MAX_RANGE:
+                    continue
+                solution = ballistic(dh, cz - mortar_origin_z)
+                if solution is None:
+                    continue
+                pitch, flight = solution
+                if flight > MULTIKILL_MAX_FLIGHT:
+                    continue
+
+                score = 0.0
+                killed_ids = []
+                for enemy, ex, ey, ez, _old_r in members:
+                    r = math.sqrt((ex - cx) ** 2 + (ey - cy) ** 2 + (ez - cz) ** 2)
+                    if r > splash_radius:
+                        continue
+                    falloff = max(0.30, 1.0 - 0.70 * r / splash_radius)
+                    expected_damage = splash * falloff
+                    score += expected_damage
+                    hp = float(enemy.get("hp", 1400.0))
+                    if hp <= expected_damage:
+                        killed_ids.append(enemy.get("id"))
+                        score += 85.0
+                        enemy_cubes = max(0, int((enemy.get("m") or {}).get("cubes", 0) or 0))
+                        score += min(10, enemy_cubes) * 7.0
+                        enemy_weapons = enemy.get("weapons") or set()
+                        if any(k in enemy_weapons for k in ("laser", "lightning", "mortar")):
+                            score += 25.0  # a kill can drop a useful special weapon
+                    elif hp <= expected_damage * 1.5:
+                        score += 18.0  # close to a follow-up kill
+
+                # Require a meaningful multi-target result, not merely two
+                # enemies grazing the outer edge of the splash radius.
+                if score < MULTIKILL_MIN_SCORE:
+                    continue
+                yaw = math.atan2(cy - y, cx - x)
+                candidate = {
+                    "slot": mortar_slot,
+                    "yaw": yaw,
+                    "pitch": pitch,
+                    "score": score,
+                    "count": len(members),
+                    "ids": tuple(m[0].get("id") for m in members),
+                    "kills": tuple(killed_ids),
+                    "distance": dh,
+                    "flight": flight,
+                    "centre": (cx, cy, cz),
+                    "members": members,
+                }
+                if (best is None or candidate["score"] > best_score or
+                        (candidate["score"] == best_score and candidate["distance"] < best["distance"])):
+                    best, best_score = candidate, candidate["score"]
+
+        if best is None:
+            return None
+
+        # Verify only the chosen blast point against map occlusion. Splash is
+        # blocked by walls; reject the plan rather than firing through cover.
+        cx, cy, cz = best["centre"]
+        clear_members = []
+        for enemy, ex, ey, ez, old_r in best["members"]:
+            if not self.world.blocked(cx, cy, ex, ey):
+                clear_members.append((enemy, ex, ey, ez, old_r))
+        if len(clear_members) < MULTIKILL_MIN_TARGETS:
+            return None
+
+        # Re-score after obstruction filtering so blocked victims do not count
+        # toward the expected multi-target value.
+        score = 0.0
+        killed_ids = []
+        for enemy, ex, ey, ez, _old_r in clear_members:
+            r = math.sqrt((ex - cx) ** 2 + (ey - cy) ** 2 + (ez - cz) ** 2)
+            if r > splash_radius:
+                continue
+            falloff = max(0.30, 1.0 - 0.70 * r / splash_radius)
+            expected_damage = splash * falloff
+            score += expected_damage
+            hp = float(enemy.get("hp", 1400.0))
+            if hp <= expected_damage:
+                killed_ids.append(enemy.get("id"))
+                score += 85.0
+                enemy_cubes = max(0, int((enemy.get("m") or {}).get("cubes", 0) or 0))
+                score += min(10, enemy_cubes) * 7.0
+                enemy_weapons = enemy.get("weapons") or set()
+                if any(k in enemy_weapons for k in ("laser", "lightning", "mortar")):
+                    score += 25.0
+            elif hp <= expected_damage * 1.5:
+                score += 18.0
+
+        if score < MULTIKILL_MIN_SCORE:
+            return None
+        best["score"] = score
+        best["count"] = len(clear_members)
+        best["ids"] = tuple(m[0].get("id") for m in clear_members)
+        best["kills"] = tuple(killed_ids)
+        best.pop("centre", None)
+        best.pop("members", None)
+        return best
+
     # ------------------------------------------------------------------ combat
     def _combat(self, act, obs, me, x, y, z, t, thr, vis, hot, late, zi, move):
         stats = me.get("stats") or {}
@@ -869,7 +1137,7 @@ class Bot:
         fire = [False, False]
         reload = False
 
-        tgt = self._pick_target(vis, hot, x, y)
+        tgt = self._pick_target(vis, hot)
 
         want = False
         if tgt is not None:
@@ -962,6 +1230,25 @@ class Bot:
                             fire[si] = ok
                     else:
                         fire[si] = ok
+
+        # Use mortar splash only when a projected cluster has strong combined
+        # value. This never changes the movement target and yields to an active
+        # laser charge or an immediate close-range lightning interrupt.
+        cluster = self._mortar_cluster_plan(me, x, y, z, vis)
+        if cluster is not None:
+            cslot = cluster["slot"]
+            cyaw, cpitch = cluster["yaw"], cluster["pitch"]
+            cpitch = max(stats.get("min_pitch", -0.7), min(stats.get("max_pitch", 1.3), cpitch))
+            cd = max(1.0, cluster["distance"])
+            ctol = max(0.02, min(0.08, 2.0 / cd))
+            cluster_aligned = (
+                abs(wrap(cyaw - cur_yaw)) < ctol and
+                abs(cpitch - cur_pitch) < max(ctol, 0.06)
+            )
+            aim = [cyaw, cpitch]
+            fire = [False, False]
+            if 0 <= cslot < len(fire):
+                fire[cslot] = cluster_aligned
 
         if laser_slot is not None and ws[laser_slot].get("charge", 0.0) > 0 and not fire[laser_slot] and aim is None:
             fire[laser_slot] = False
