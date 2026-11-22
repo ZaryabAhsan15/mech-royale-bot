@@ -1,12 +1,16 @@
-"""Target-commitment snowball bot for mechfight/1 (Mech Royale).
+"""Early-kill snowball bot for mechfight/1 (Mech Royale).
 
-Based on the submitted hunter_snowball.py that scored 2.69 twice. It preserves
-that strategy and adds short target commitment plus recent-hit pressure memory
-to concentrate damage, while allowing urgent laser interrupts, close attackers,
-and clean finishing opportunities to override the commitment.
+Based on the bot source supplied in the conversation. It preserves the original
+zone navigation, quiet movement, cover seeking, crate handling, weapon rush,
+combat movement, and aiming. It adds two focused snowball behaviors:
 
-This is an experimental build. Syntax and targeted helper tests pass, but the
-official conformance check and scorer have not been run.
+1. Select finishable, accessible weak opponents; do not spend the opening chasing
+a healthy distant laser carrier when a more practical kill is available.
+2. After a confirmed kill, briefly collect nearby cubes and a dropped special
+weapon only when nearby enemies cannot immediately contest the loot.
+
+This is an experimental strategy build. Local syntax/helper tests do not establish
+that it scores better, and the official conformance check/scorer has not been run.
 """
 import math
 import random
@@ -77,20 +81,9 @@ SNOWBALL_LOOT_RADIUS = 24.0
 SNOWBALL_MIN_ENEMY_DISTANCE = 68.0
 SNOWBALL_MIN_HP_FRACTION = 0.50
 
-# Target commitment: reduce damage-splitting without becoming blind to emergencies.
-TARGET_COMMIT_MIN_S = 0.95
-TARGET_COMMIT_MAX_S = 2.8
-TARGET_SWITCH_MARGIN_SHORT = 210.0
-TARGET_SWITCH_MARGIN_MID = 135.0
-TARGET_SWITCH_MARGIN_LONG = 65.0
-TARGET_MEMORY_S = 0.65
-TARGET_HIT_MEMORY_S = 3.0
-TARGET_KILL_OVERRIDE_HP = 260.0
-TARGET_KILL_OVERRIDE_DISTANCE = 110.0
-
 
 class Bot:
-    name = "hunter-snowball-v12"
+    name = "hunter-snowball-v13-range-gated"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -128,9 +121,6 @@ class Bot:
         self.my_weapons = set()
         self.focus_id = None
         self.focus_pos = None
-        self.focus_since = -999.0
-        self.focus_last_seen_t = -999.0
-        self.recent_hits = {}           # enemy id -> last confirmed hit time
         self.last_kill_t = -999.0
         self.last_kill_id = None
         self.last_kill_pos = None
@@ -240,11 +230,6 @@ class Bot:
                     for cid, ce in self.crates.items():
                         if math.hypot(ce[0] - x, ce[1] - y) < 70.0:
                             self.crate_bad.add(cid)
-            elif ev.get("type") == "hit":
-                target_id = ev.get("target")
-                # Mech IDs are 0..15. Ignore crate/NPC hits for target commitment.
-                if isinstance(target_id, int) and 0 <= target_id < 16 and target_id != me.get("id"):
-                    self.recent_hits[target_id] = t
             elif ev.get("type") == "kill":
                 self.last_kill_t = t
                 self.last_kill_id = ev.get("target")
@@ -252,15 +237,6 @@ class Bot:
                 self.last_kill_pos = (
                     self.focus_pos if self.focus_id == self.last_kill_id else None
                 )
-                if self.focus_id == self.last_kill_id:
-                    self.focus_id = None
-                    self.focus_pos = None
-                    self.focus_since = -999.0
-                    self.focus_last_seen_t = -999.0
-        for target_id, hit_t in list(self.recent_hits.items()):
-            if t - hit_t > TARGET_HIT_MEMORY_S:
-                del self.recent_hits[target_id]
-
         hot = (t - self.last_dmg_t) < 2.5
 
         zi = self._zone(obs, x, y)
@@ -462,7 +438,7 @@ class Bot:
         act["jump"] = jump
 
         # ---- weapons / aim ----
-        self._combat(act, obs, me, x, y, z, t, thr, vis, hot, late, zi, move, ftgt)
+        self._combat(act, obs, me, x, y, z, t, thr, vis, hot, late, zi, move)
 
         # ---- pick up ----
         if loot is not None:
@@ -703,35 +679,24 @@ class Bot:
         return best
 
     def _pick_target(self, vis, hot):
-        """Concentrate damage on one accessible victim, with emergency switch-outs.
-
-        The base score remains the proven snowball score. A short lock prevents
-        small per-tick score fluctuations from splitting damage across targets.
-        A nearby laser charge, a recent close attacker, or a clean finishing
-        opportunity can break the lock immediately.
-        """
+        """Prefer accessible early kills; avoid long chases after healthy laser holders."""
         if not vis:
-            # Keep a very short memory so a target ducking behind a building for
-            # a moment does not erase its identity/last position. We still do not
-            # shoot at an unseen target.
-            if self.focus_id is not None and self.now - self.focus_last_seen_t > TARGET_MEMORY_S:
-                self.focus_id = None
-                self.focus_pos = None
-                self.focus_since = -999.0
+            self.focus_id = None
+            self.focus_pos = None
             return None
 
-        scored = []
-        by_id = {}
+        best = None
+        best_cost = float("inf")
         for e in vis:
             hp = float(e.get("hp", 1400.0))
             d = float(e["d"])
             weapons = e.get("weapons") or set()
             m = e.get("m") or {}
 
-            # Preserve the existing weakest-first + accessibility foundation.
+            # Preserve the original weakest-first cost as the foundation.
             cost = hp + 10.0 * d
 
-            # Prefer realistic finishes; the kill also creates a cube/weapon opportunity.
+            # Finish an already damaged opponent instead of repeatedly switching targets.
             if hp <= 350.0:
                 cost -= 260.0
             elif hp <= 600.0:
@@ -739,16 +704,17 @@ class Bot:
             elif hp <= 850.0:
                 cost -= 70.0
 
-            # Avoid spending the opening chasing a healthy, distant laser carrier.
+            # During the opening, a healthy distant laser carrier is a poor chase.
+            # This is only a proxy for threat/loadout, not a claim that we know bot difficulty.
             if self.now < 210.0 and "laser" in weapons and hp > 700.0 and d > 65.0:
                 cost += 360.0
 
-            # A charging laser is urgent only when a lightning interrupt is feasible.
+            # If lightning can interrupt an active laser at close range, take that opportunity.
             if (e.get("charging") and d <= 42.0 and "lightning" in self.my_weapons
-                    and "laser" in weapons and "mortar" not in weapons):
+                    and "mortar" not in weapons):
                 cost -= 320.0
             elif e.get("charging") and d > 45.0:
-                # Do not chase an out-of-range charge just to duel it.
+                # Do not run toward an out-of-range charge just to duel it.
                 cost += 100.0
 
             # A weakened carrier with cubes is a valuable kill/drop opportunity.
@@ -756,98 +722,49 @@ class Bot:
             if hp <= 900.0 and d <= 110.0 and carried_cubes:
                 cost -= min(150.0, 15.0 * carried_cubes)
 
-            # Keep pressure on an opponent we have actually hit recently. This
-            # is a modest bonus, not enough to override an emergency or easy kill.
-            hit_age = self.now - self.recent_hits.get(e.get("id"), -999.0)
-            if hit_age < 1.4:
-                cost -= 105.0
-            elif hit_age < TARGET_HIT_MEMORY_S:
-                cost -= 45.0
-
             if hot and e.get("id") == self.last_attacker and d <= 80.0:
                 cost -= 130.0
 
-            scored.append((cost, e))
-            by_id[e.get("id")] = (cost, e)
+            if cost < best_cost:
+                best_cost, best = cost, e
 
-        best_cost, best = min(scored, key=lambda item: item[0])
-        chosen = best
-
-        # If a focus is active, inspect ALL visible challengers for urgent
-        # exceptions before applying normal score-based target commitment.
-        current_pair = by_id.get(self.focus_id)
-        if current_pair is not None:
-            current_cost, current = current_pair
-            emergency_candidates = []
-            for candidate_cost, candidate in scored:
-                if candidate.get("id") == self.focus_id:
-                    continue
-                candidate_weapons = candidate.get("weapons") or set()
-                emergency_interrupt = (
-                    candidate.get("charging") and candidate.get("d", 999.0) <= 42.0
-                    and "lightning" in self.my_weapons
-                    and "laser" in candidate_weapons
-                    and "mortar" not in candidate_weapons
-                )
-                emergency_attacker = (
-                    hot and candidate.get("id") == self.last_attacker
-                    and candidate.get("d", 999.0) <= 60.0
-                )
-                clean_finish = (
-                    candidate.get("hp", 1400.0) <= TARGET_KILL_OVERRIDE_HP
-                    and candidate.get("d", 999.0) <= TARGET_KILL_OVERRIDE_DISTANCE
-                    and current.get("hp", 1400.0) > candidate.get("hp", 1400.0) + 180.0
-                )
-                if emergency_interrupt or emergency_attacker or clean_finish:
-                    # Slightly prefer a laser interrupt, then a close attacker,
-                    # then an easy finish. Candidate cost breaks ties within a class.
-                    urgency = 0 if emergency_interrupt else 1 if emergency_attacker else 2
-                    emergency_candidates.append((urgency, candidate_cost, candidate))
-
-            if emergency_candidates:
-                chosen = min(emergency_candidates, key=lambda item: (item[0], item[1]))[2]
-            elif best.get("id") != self.focus_id:
-                elapsed = self.now - self.focus_since
-                if elapsed < TARGET_COMMIT_MIN_S:
-                    margin = TARGET_SWITCH_MARGIN_SHORT
-                elif elapsed < 2.0:
-                    margin = TARGET_SWITCH_MARGIN_MID
-                else:
-                    margin = TARGET_SWITCH_MARGIN_LONG
-
-                lock_expired = elapsed >= TARGET_COMMIT_MAX_S
-                materially_better = best_cost < current_cost - margin
-
-                if not (lock_expired or materially_better):
-                    chosen = current
-
-        chosen_id = chosen.get("id")
-        if chosen_id != self.focus_id:
-            self.focus_id = chosen_id
-            self.focus_since = self.now
-        elif self.focus_since < -100.0:
-            self.focus_since = self.now
-
-        self.focus_last_seen_t = self.now
-        self.focus_pos = (chosen["x"], chosen["y"], chosen["z"])
-        return chosen
+        if best is not None:
+            self.focus_id = best.get("id")
+            self.focus_pos = (best["x"], best["y"], best["z"])
+        return best
 
     def _weapon_edge(self, me, tgt):
-        """Original v9 duel trigger retained to isolate the snowball experiment."""
-        mine = {w["kind"] for w in me["weapons"] if w}
+        """Only treat lightning as a duel advantage when its laser counter is usable now."""
+        mine = {w["kind"]: w for w in me["weapons"] if w}
         theirs = set((tgt.get("m") or {}).get("weapons") or [])
-        if "lightning" in mine and me["energy"] >= 15 and "mortar" not in theirs:
-            return True
+
+        # Lightning is not a long-range answer to a laser: only close when the
+        # target is actually inside lightning range, visible, and not carrying
+        # mortar (which counters lightning).
+        lightning = mine.get("lightning")
+        if (lightning is not None and "laser" in theirs and "mortar" not in theirs
+                and me.get("energy", 0.0) >= 15.0 and tgt.get("los", False)):
+            lr = lightning.get("stats", {}).get("range", 45.0)
+            if tgt.get("d", 1e9) <= lr - 4.0:
+                return True
+
+        # Preserve the proven baseline's laser engagement rule unchanged.
         if "laser" in mine and "lightning" not in theirs:
             return True
         return False
 
     def _pref_range(self, me, tgt):
-        """Original preferred engagement ranges retained for a controlled experiment."""
-        mine = {w["kind"] for w in me["weapons"] if w}
+        """Use close lightning range only when a visible laser can be interrupted."""
+        mine = {w["kind"]: w for w in me["weapons"] if w}
         theirs = set((tgt.get("m") or {}).get("weapons") or [])
-        if "lightning" in mine and me["energy"] >= 15 and "mortar" not in theirs:
-            return 32.0
+
+        lightning = mine.get("lightning")
+        if (lightning is not None and "laser" in theirs and "mortar" not in theirs
+                and me.get("energy", 0.0) >= 15.0 and tgt.get("los", False)):
+            lr = lightning.get("stats", {}).get("range", 45.0)
+            if tgt.get("d", 1e9) <= lr - 4.0:
+                return 32.0
+
         if "laser" in mine and "lightning" not in theirs:
             return 85.0
         if "mortar" in mine and "laser" not in theirs and tgt["d"] > 60.0:
@@ -950,7 +867,7 @@ class Bot:
         return [yaw, pitch]
 
     # ------------------------------------------------------------------ combat
-    def _combat(self, act, obs, me, x, y, z, t, thr, vis, hot, late, zi, move, selected_target=None):
+    def _combat(self, act, obs, me, x, y, z, t, thr, vis, hot, late, zi, move):
         stats = me.get("stats") or {}
         mh = stats.get("muzzle_height", 7.0)
         cur_yaw, cur_pitch = me["aim"][0], me["aim"][1]
@@ -958,7 +875,7 @@ class Bot:
         fire = [False, False]
         reload = False
 
-        tgt = selected_target
+        tgt = self._pick_target(vis, hot)
 
         want = False
         if tgt is not None:
