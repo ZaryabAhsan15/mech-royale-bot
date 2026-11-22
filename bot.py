@@ -27,6 +27,7 @@ UPGRADE_PREF = ["gun_damage", "laser_damage", "gun_rate", "laser_charge", "light
                 "lightning_chain", "lightning_range", "gun_mag", "gun_velocity", "jets",
                 "mortar_splash", "mortar_reload", "mortar_velocity", "laser_pierce"]
 # Tuning switches (change these if a submission scores worse than expected)
+WEAPON_FIGHT = True    # v6: duel (hold the weapon's best range, strafe) only when the weapon we carry beats the target's; gun-only = flee as before
 FIGHT_MOVE = False     # duel/strafe instead of fleeing when healthy; False = old flee movement, still shoots more
 STRAFE_W = 0.8         # strafing strength while dueling (0 = hold position, ~1.5 = jink hard)
 # below this HP fraction an upgrade offer picks survival first, otherwise damage first
@@ -51,7 +52,7 @@ LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
 
 
 class Bot:
-    name = "hunter-v5"
+    name = "hunter-v6"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -224,7 +225,8 @@ class Bot:
         hpf = me["hp"] / max(1.0, me["max_hp"])
         ftgt = self._pick_target(vis, hot)
         n_close = sum(1 for e in vis if e["d"] < 110.0)
-        fight = (FIGHT_MOVE and ftgt is not None and ftgt["d"] < 170.0 and not urgent and not go and
+        fight = (ftgt is not None and (FIGHT_MOVE or (WEAPON_FIGHT and self._weapon_edge(me, ftgt))) and
+                 ftgt["d"] < 170.0 and not urgent and not go and
                  hpf > (0.40 if self.fighting is False else 0.28) and (n_close <= 2 or hpf > 0.75))
         self.fighting = fight
 
@@ -511,6 +513,17 @@ class Bot:
                 if e["id"] == self.last_attacker and e["d"] < 60.0:
                     return e
         return min(vis, key=lambda e: e["hp"] + 10.0 * e["d"])
+
+    def _weapon_edge(self, me, tgt):
+        """True if we carry a weapon that beats what the target carries (laser > mortar, lightning > laser,
+        mortar > lightning; same test as _pref_range) -> worth standing and fighting at that weapon's range."""
+        mine = {w["kind"] for w in me["weapons"] if w}
+        theirs = set((tgt.get("m") or {}).get("weapons") or [])
+        if "lightning" in mine and me["energy"] >= 15 and "mortar" not in theirs:
+            return True
+        if "laser" in mine and "lightning" not in theirs:
+            return True
+        return False
 
     def _pref_range(self, me, tgt):
         """Distance we want to fight at, from what we carry and what the target carries."""
