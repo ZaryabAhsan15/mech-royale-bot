@@ -55,16 +55,17 @@ RUSH_COMMIT_DIST = 30.0    # enemy in sight: still go for a laser/lightning at m
 RUSH_COMMIT_ENEMY = 60.0   # ... provided the nearest enemy is at least this far away
 LOOT_VALUE = {"laser": 3.0, "lightning": 3.4 if WEAPON_RUSH else 2.5, "mortar": 1.5}
 # --- v8 ---
-SWAP_UP = True             # swap a held special weapon for a better one (mortar < laser < lightning) lying close by while calm
+AIM_LATENCY = 0.075        # v9: lead shots by the ~0.05-0.1 s between the observation and the shot leaving (0 = old aim exactly)
+SWAP_UP = False            # swap a held special weapon for a better one (mortar < laser < lightning) lying close by while calm
 SWAP_RANGE = 35.0
 WEAPON_RANK = {"mortar": 1, "laser": 2, "lightning": 3}
-OPENING_SPIN = True        # scan the torso faster for the first seconds so nearby weapons are seen sooner
+OPENING_SPIN = False       # scan the torso faster for the first seconds so nearby weapons are seen sooner
 OPENING_S = 8.0
 LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
 
 
 class Bot:
-    name = "hunter-v8"
+    name = "hunter-v9"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -716,6 +717,11 @@ class Bot:
             d = math.hypot(dx, dy)
             tz = tgt["z"] + 4.5
             my_z = z + mh
+            # where we and the target will be when the shot actually leaves (lockstep: 1-2 ticks later)
+            ox, oy = x, y
+            if AIM_LATENCY > 0.0:
+                ox += me["vel"][0] * AIM_LATENCY
+                oy += me["vel"][1] * AIM_LATENCY
             opts = []
             for i, w in enumerate(ws):
                 if not w:
@@ -745,23 +751,24 @@ class Bot:
                 if k == "gun" or k == "mortar":
                     spd = st.get("speed", 252.0 if k == "gun" else 72.0)
                     px, py, pz = tgt["x"], tgt["y"], tz
-                    tt = d / spd
+                    tt = d / spd + AIM_LATENCY
                     for _ in range(3):
                         px = tgt["x"] + tgt["vx"] * tt
                         py = tgt["y"] + tgt["vy"] * tt
                         pz = tz + tgt["vz"] * tt * 0.5
-                        tt = math.hypot(px - x, py - y) / spd
-                    yaw = math.atan2(py - y, px - x)
-                    hd = math.hypot(px - x, py - y)
+                        tt = math.hypot(px - ox, py - oy) / spd + AIM_LATENCY
+                    yaw = math.atan2(py - oy, px - ox)
+                    hd = math.hypot(px - ox, py - oy)
                     if k == "gun":
                         pitch = math.atan2(pz - my_z, hd)
                     else:
                         g = self.cfg["weapons"]["mortar"].get("gravity", 22.0)
                         r = g * hd / (spd * spd)
                         pitch = 0.5 * math.asin(r) if r < 0.98 else None
-                else:  # laser / lightning: hitscan, aim straight at the target
-                    yaw = math.atan2(dy, dx)
-                    pitch = math.atan2(tz - my_z, d)
+                else:  # laser / lightning: hitscan, aim at where the target will be when the beam leaves
+                    lx, ly = tgt["x"] + tgt["vx"] * AIM_LATENCY, tgt["y"] + tgt["vy"] * AIM_LATENCY
+                    yaw = math.atan2(ly - oy, lx - ox)
+                    pitch = math.atan2(tz - my_z, math.hypot(lx - ox, ly - oy))
                 if pitch is not None:
                     pitch = max(stats.get("min_pitch", -0.7), min(stats.get("max_pitch", 1.3), pitch))
                     aim = [yaw, pitch]
