@@ -9,9 +9,8 @@ a healthy distant laser carrier when a more practical kill is available.
 2. After a confirmed kill, briefly collect nearby cubes and a dropped special
 weapon only when nearby enemies cannot immediately contest the loot.
 
-This experimental build adds conditional mortar splash targeting for visible enemy
-clusters. It preserves the established snowball baseline. Local tests do not establish
-that it scores better; the official conformance check/scorer has not been run.
+This is an experimental strategy build. Local syntax/helper tests do not establish
+that it scores better, and the official conformance check/scorer has not been run.
 """
 import math
 import random
@@ -82,20 +81,21 @@ SNOWBALL_LOOT_RADIUS = 24.0
 SNOWBALL_MIN_ENEMY_DISTANCE = 68.0
 SNOWBALL_MIN_HP_FRACTION = 0.50
 
-# Multi-kill mortar support. This never changes movement or target selection;
-# it only substitutes a mortar shot when a visible cluster offers clearly
-# better combined value than an ordinary single-target mortar hit.
+# Conservative mortar cluster support. It may only refine an already-selected
+# mortar shot at the current weakest target; it never replaces another weapon.
 MULTIKILL_ENABLED = True
 MULTIKILL_MIN_TARGETS = 2
 MULTIKILL_SPLASH_RADIUS = 7.0
 MULTIKILL_MAX_RANGE = 180.0
 MULTIKILL_MIN_RANGE = 38.0
 MULTIKILL_MAX_FLIGHT = 2.8
-MULTIKILL_MIN_SCORE = 260.0
+MULTIKILL_MIN_SCORE = 280.0
+MULTIKILL_MAX_YAW_SHIFT = math.radians(12.0)
+MULTIKILL_MAX_PITCH_SHIFT = math.radians(14.0)
 
 
 class Bot:
-    name = "hunter-multikill"
+    name = "hunter-snowball-v17"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -863,11 +863,11 @@ class Bot:
         return [yaw, pitch]
 
     def _mortar_cluster_plan(self, me, x, y, z, vis):
-        """Find a high-value mortar splash point for multiple visible enemies.
+        """Find a safe, high-value mortar splash point for visible enemies.
 
-        This is deliberately fire-only: it does not steer the mech toward a
-        cluster. Candidate enemy positions are projected to mortar impact time,
-        and candidates blocked from the blast point are excluded.
+        The caller imposes stricter gates: the current selected target must be
+        in the cluster, the normal selected weapon must already be mortar, and
+        an otherwise-ready shot must not be discarded.
         """
         if not MULTIKILL_ENABLED or len(vis) < MULTIKILL_MIN_TARGETS:
             return None
@@ -1151,6 +1151,8 @@ class Bot:
                 laser_slot = i
 
         aim = None
+        selected_slot = None
+        selected_weapon_kind = None
         if tgt is not None and want:
             dx, dy = tgt["x"] - x, tgt["y"] - y
             d = math.hypot(dx, dy)
@@ -1189,6 +1191,8 @@ class Bot:
                 prio, si = opts[0]
                 w = ws[si]
                 k = w["kind"]
+                selected_slot = si
+                selected_weapon_kind = k
                 st = w.get("stats", {})
                 if k == "gun" or k == "mortar":
                     spd = st.get("speed", 252.0 if k == "gun" else 72.0)
@@ -1231,24 +1235,28 @@ class Bot:
                     else:
                         fire[si] = ok
 
-        # Use mortar splash only when a projected cluster has strong combined
-        # value. This never changes the movement target and yields to an active
-        # laser charge or an immediate close-range lightning interrupt.
-        cluster = self._mortar_cluster_plan(me, x, y, z, vis)
-        if cluster is not None:
-            cslot = cluster["slot"]
-            cyaw, cpitch = cluster["yaw"], cluster["pitch"]
-            cpitch = max(stats.get("min_pitch", -0.7), min(stats.get("max_pitch", 1.3), cpitch))
-            cd = max(1.0, cluster["distance"])
-            ctol = max(0.02, min(0.08, 2.0 / cd))
-            cluster_aligned = (
-                abs(wrap(cyaw - cur_yaw)) < ctol and
-                abs(cpitch - cur_pitch) < max(ctol, 0.06)
-            )
-            aim = [cyaw, cpitch]
-            fire = [False, False]
-            if 0 <= cslot < len(fire):
-                fire[cslot] = cluster_aligned
+        # Opportunistic multi-kill: refine an existing mortar shot only.
+        # Never steal aim from gun/laser/lightning, never clear another trigger,
+        # and never redirect a shot to a cluster that excludes our chosen target.
+        if (MULTIKILL_ENABLED and tgt is not None and aim is not None
+                and selected_weapon_kind == "mortar"
+                and selected_slot is not None and not any(fire)):
+            cluster = self._mortar_cluster_plan(me, x, y, z, vis)
+            if (cluster is not None and cluster["slot"] == selected_slot
+                    and tgt.get("id") in cluster.get("ids", ())):
+                cyaw, cpitch = cluster["yaw"], cluster["pitch"]
+                cpitch = max(stats.get("min_pitch", -0.7),
+                             min(stats.get("max_pitch", 1.3), cpitch))
+                yaw_shift = abs(wrap(cyaw - aim[0]))
+                pitch_shift = abs(cpitch - aim[1])
+                if (yaw_shift <= MULTIKILL_MAX_YAW_SHIFT
+                        and pitch_shift <= MULTIKILL_MAX_PITCH_SHIFT):
+                    aim = [cyaw, cpitch]
+                    cd = max(1.0, cluster["distance"])
+                    ctol = max(0.02, min(0.08, 2.0 / cd))
+                    aligned = (abs(wrap(cyaw - cur_yaw)) < ctol and
+                               abs(cpitch - cur_pitch) < max(ctol, 0.06))
+                    fire[selected_slot] = aligned
 
         if laser_slot is not None and ws[laser_slot].get("charge", 0.0) > 0 and not fire[laser_slot] and aim is None:
             fire[laser_slot] = False
