@@ -47,12 +47,18 @@ FARM_SPEED = 1.0       # walk speed (fraction of walk_speed) to crates and cubes
 FARM_MIN_HP = 0.85     # only farm when at least this healthy (shooting crates may pause regen, so heal first)
 FARM_MAX_T = 300.0     # stop farming after this match time (s)
 FARM_GIVEUP_S = 30.0   # give up on one crate after this long (unreachable / stuck)
-LOOT_VALUE = {"laser": 3.0, "lightning": 2.5, "mortar": 1.5}
+# --- weapon rush (v7): the house squad carries gun + laser (dead mechs drop everything but the gun); lightning cancels a
+# laser charge and locks it out. Get a weapon BEFORE the first hunter lands: walk to weapons at full speed (was 4.6 m/s),
+# prefer lightning over laser, and finish grabbing a weapon that is almost underfoot even if an enemy is already in sight.
+WEAPON_RUSH = True
+RUSH_COMMIT_DIST = 30.0    # enemy in sight: still go for a laser/lightning at most this far away ...
+RUSH_COMMIT_ENEMY = 60.0   # ... provided the nearest enemy is at least this far away
+LOOT_VALUE = {"laser": 3.0, "lightning": 3.4 if WEAPON_RUSH else 2.5, "mortar": 1.5}
 LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
 
 
 class Bot:
-    name = "hunter-v6"
+    name = "hunter-v7"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -232,10 +238,14 @@ class Bot:
 
         # ---- loot ----
         loot = None
-        if not danger and not urgent and not (late and t > 300):
-            farm_ok = (FARM_CRATES and not go and hpf >= FARM_MIN_HP and t < FARM_MAX_T and
+        rush_try = WEAPON_RUSH and danger and bool(vis) and not urgent and not go
+        if (not danger or rush_try) and not urgent and not (late and t > 300):
+            farm_ok = (FARM_CRATES and not go and hpf >= FARM_MIN_HP and t < FARM_MAX_T and not rush_try and
                        any(w and w["kind"] == "gun" for w in me["weapons"]))
-            loot = self._find_loot(obs, me, x, y, z, thr, zi, farm_ok)
+            if rush_try:
+                loot = self._rush_pickup(obs, me, x, y, z, thr)
+            else:
+                loot = self._find_loot(obs, me, x, y, z, thr, zi, farm_ok)
         if loot is not None and loot.get("crate"):
             self.farm = loot
 
@@ -259,7 +269,7 @@ class Bot:
             speed = 1.0 if need / (sneak * walk) > t_left * 0.8 else sneak
             w_goal = 3.0
         elif loot is not None:
-            w_goal = 2.5
+            w_goal = 7.0 if rush_try else 2.5
         if danger:
             speed = 1.0
         elif caution and speed < 1.0:
@@ -268,6 +278,8 @@ class Bot:
             speed = 1.0
         if FARM_CRATES and loot is not None and not loot.get("is_weapon") and not caution and not (urgent or go):
             speed = FARM_SPEED
+        if WEAPON_RUSH and loot is not None and loot.get("is_weapon") and not (urgent or go):
+            speed = 1.0
 
         # ---- hop: jump + jet over walls when we are walled in or stuck and must leave ----
         hop = False
@@ -361,6 +373,26 @@ class Bot:
         return act
 
     # ------------------------------------------------------------------ loot
+    def _rush_pickup(self, obs, me, x, y, z, thr):
+        """Enemy in sight but still far: a laser/lightning almost underfoot is worth grabbing first (it decides the fight)."""
+        if any(e["d"] < RUSH_COMMIT_ENEMY for e in thr if not e.get("sound")):
+            return None
+        slots = me["weapons"]
+        if len(slots) < 2 or slots[1] is not None:
+            return None
+        have = {w["kind"] for w in slots if w}
+        best, bd = None, 1e9
+        for p in obs["pickups"]:
+            k = p["kind"]
+            if k not in ("laser", "lightning") or k in have or p["id"] in self.dead_loot:
+                continue
+            d = math.hypot(p["pos"][0] - x, p["pos"][1] - y)
+            if d > RUSH_COMMIT_DIST or abs(p["pos"][2] - z) > 3.0:
+                continue
+            if d < bd:
+                bd, best = d, {"id": p["id"], "pos": p["pos"], "is_weapon": True}
+        return best
+
     def _find_loot(self, obs, me, x, y, z, thr, zi=None, farm_ok=False):
         threats_near = any(e["d"] < 100 and not e.get("sound") for e in thr)
         if threats_near:
