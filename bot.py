@@ -60,8 +60,8 @@ FARM_MAX_T = 300.0
 FARM_GIVEUP_S = 30.0
 
 WEAPON_RUSH = True
-RUSH_COMMIT_DIST = 55.0
-RUSH_COMMIT_ENEMY = 45.0
+RUSH_COMMIT_DIST = 30.0
+RUSH_COMMIT_ENEMY = 60.0
 
 # Laser is the default long-range pickup preference. Lightning remains useful
 # as a close-range laser-charge interrupt, not as a universal weapon upgrade.
@@ -73,7 +73,7 @@ SWAP_RANGE = 35.0
 WEAPON_RANK = {"mortar": 1, "laser": 2, "lightning": 3}
 OPENING_SPIN = False
 OPENING_S = 8.0
-LOOT_RANGE = {"laser": 170.0, "lightning": 150.0, "mortar": 70.0}
+LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
 
 # Snowballing: only sweep a victim's nearby drops briefly after a confirmed kill.
 SNOWBALL_KILL_WINDOW = 4.5
@@ -83,7 +83,7 @@ SNOWBALL_MIN_HP_FRACTION = 0.50
 
 
 class Bot:
-    name = "snowball-v14b"
+    name = "hunter-snowball"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
