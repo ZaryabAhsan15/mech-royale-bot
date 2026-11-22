@@ -54,11 +54,17 @@ WEAPON_RUSH = True
 RUSH_COMMIT_DIST = 30.0    # enemy in sight: still go for a laser/lightning at most this far away ...
 RUSH_COMMIT_ENEMY = 60.0   # ... provided the nearest enemy is at least this far away
 LOOT_VALUE = {"laser": 3.0, "lightning": 3.4 if WEAPON_RUSH else 2.5, "mortar": 1.5}
+# --- v8 ---
+SWAP_UP = True             # swap a held special weapon for a better one (mortar < laser < lightning) lying close by while calm
+SWAP_RANGE = 35.0
+WEAPON_RANK = {"mortar": 1, "laser": 2, "lightning": 3}
+OPENING_SPIN = True        # scan the torso faster for the first seconds so nearby weapons are seen sooner
+OPENING_S = 8.0
 LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
 
 
 class Bot:
-    name = "hunter-v7"
+    name = "hunter-v8"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -367,6 +373,8 @@ class Bot:
             lx, ly = loot["pos"][0], loot["pos"][1]
             if math.hypot(lx - x, ly - y) < self.cfg["loot"]["pickup_radius"] - 0.6 and loot.get("is_weapon"):
                 act["take"] = loot["id"]
+                if loot.get("swap") is not None:
+                    act["drop"] = loot["swap"]      # leave the worse weapon on the ground
                 self.dead_loot.add(loot["id"])  # don't retry forever if it fails
 
         mf.draw.label(f"{'URG ' if urgent else ''}{'GO ' if go else ''}{'DNG ' if danger else ''}hp{me['hp']:.0f} v{len(vis)}")
@@ -411,6 +419,20 @@ class Bot:
                 sc = LOOT_VALUE[k] / (10.0 + d)
                 if sc > bs:
                     bs, best = sc, {"id": p["id"], "pos": p["pos"], "is_weapon": True}
+        elif SWAP_UP and len(slots) > 1 and slots[1] is not None and slots[1]["kind"] in WEAPON_RANK \
+                and slots[1].get("charge", 0.0) <= 0.0:
+            mine = WEAPON_RANK[slots[1]["kind"]]
+            have = {w["kind"] for w in slots if w}
+            for p in obs["pickups"]:
+                k = p["kind"]
+                if WEAPON_RANK.get(k, 0) <= mine or k in have or p["id"] in self.dead_loot:
+                    continue
+                d = math.hypot(p["pos"][0] - x, p["pos"][1] - y)
+                if d > SWAP_RANGE or abs(p["pos"][2] - z) > 3.0:
+                    continue
+                sc = WEAPON_RANK[k] / (10.0 + d)
+                if sc > bs:
+                    bs, best = sc, {"id": p["id"], "pos": p["pos"], "is_weapon": True, "swap": 1}
         if best is None and obs["t"] < 330:
             for c in obs["cubes"]:
                 d = math.hypot(c["pos"][0] - x, c["pos"][1] - y)
@@ -775,7 +797,7 @@ class Bot:
             elif math.hypot(*move) > 0.05:
                 aim = [math.atan2(move[1], move[0]), 0.0]
             else:
-                self.scan = wrap(self.scan + 0.22)
+                self.scan = wrap(self.scan + (0.38 if (OPENING_SPIN and t < OPENING_S) else 0.22))
                 aim = [self.scan, 0.0]
         act["aim"] = [round(aim[0], 4), round(aim[1], 4)]
         act["fire"] = fire
