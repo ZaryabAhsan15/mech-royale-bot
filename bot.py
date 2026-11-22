@@ -1,4 +1,4 @@
-"""Early-kill snowball bot for mechfight/1 (Mech Royale).
+"""Early-kill snowball bot for mechfight/1 (Mech Royale) — v16 rear-arc targeting.
 
 Based on the bot source supplied in the conversation. It preserves the original
 zone navigation, quiet movement, cover seeking, crate handling, weapon rush,
@@ -63,14 +63,14 @@ WEAPON_RUSH = True
 RUSH_COMMIT_DIST = 30.0
 RUSH_COMMIT_ENEMY = 60.0
 
-# Adaptive special-weapon policy: laser is the safe default at long range;
-# lightning is situational against an approaching laser user; mortar is only
-# preferred when several nearby opponents rely on lightning.
-LOOT_VALUE = {"laser": 3.8, "lightning": 2.6, "mortar": 1.7}
+# Laser is the default long-range pickup preference. Lightning remains useful
+# as a close-range laser-charge interrupt, not as a universal weapon upgrade.
+LOOT_VALUE = {"laser": 3.0, "lightning": 3.4 if WEAPON_RUSH else 2.5, "mortar": 1.5}
 
 AIM_LATENCY = 0.0
-SWAP_UP = True
-SWAP_RANGE = 28.0
+SWAP_UP = False
+SWAP_RANGE = 35.0
+WEAPON_RANK = {"mortar": 1, "laser": 2, "lightning": 3}
 OPENING_SPIN = False
 OPENING_S = 8.0
 LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
@@ -83,7 +83,7 @@ SNOWBALL_MIN_HP_FRACTION = 0.50
 
 
 class Bot:
-    name = "hunter-snowball-v15"
+    name = "hunter-snowball-v16"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -198,95 +198,6 @@ class Bot:
     def _weapon_map(self, me):
         return {w["kind"]: w for w in (me.get("weapons") or []) if w}
 
-    def _weapon_context(self, thr, x, y):
-        """Summarize observed enemy loadouts and whether a laser user is closing.
-
-        Sound-only bearings are deliberately excluded: they are too imprecise
-        to justify a weapon swap.
-        """
-        ctx = {
-            "laser_users": 0,
-            "mortar_users": 0,
-            "lightning_users": 0,
-            "closing_laser_users": 0,
-        }
-        for e in thr:
-            if e.get("sound"):
-                continue
-            weapons = e.get("weapons") or set()
-            d = float(e.get("d", 1e9))
-            if "laser" in weapons:
-                ctx["laser_users"] += 1
-                # Positive closing speed means the enemy is moving toward us.
-                if 45.0 < d <= 82.0 and not e.get("charging"):
-                    dx, dy = x - e["x"], y - e["y"]
-                    inv_d = 1.0 / max(d, 1e-6)
-                    closing = (e.get("vx", 0.0) * dx + e.get("vy", 0.0) * dy) * inv_d
-                    if closing >= 3.0:
-                        ctx["closing_laser_users"] += 1
-            if "mortar" in weapons:
-                ctx["mortar_users"] += 1
-            if "lightning" in weapons:
-                ctx["lightning_users"] += 1
-        return ctx
-
-    def _adaptive_weapon_values(self, thr, x, y):
-        """Return weapon pickup values based on observed opponent loadouts.
-
-        Default to laser because most meaningful engagements in the supplied
-        match evidence start well outside lightning range. Deviate only when
-        observations give a specific matchup reason.
-        """
-        values = dict(LOOT_VALUE)
-        ctx = self._weapon_context(thr, x, y)
-
-        # An uncharged laser carrier closing from just outside lightning range
-        # may enter interrupt range soon. Only then is lightning preferred.
-        if ctx["closing_laser_users"] and not ctx["mortar_users"]:
-            values["lightning"] = 4.4
-            values["laser"] = 3.6
-
-        # Mortar is a counter to lightning. Require multiple observed users
-        # and no laser users before preferring it over the safer laser option.
-        elif (ctx["lightning_users"] >= 2 and not ctx["laser_users"]
-              and not ctx["mortar_users"]):
-            values["mortar"] = 4.1
-            values["laser"] = 3.1
-            values["lightning"] = 1.8
-
-        return values, ctx
-
-    def _desired_special_weapon(self, thr, x, y):
-        """Choose a situational replacement, or None when evidence is weak."""
-        _values, ctx = self._adaptive_weapon_values(thr, x, y)
-        # Do not replace a weapon merely because another has a slightly higher
-        # generic ranking. Require a clear matchup signal.
-        if ctx["closing_laser_users"] and not ctx["mortar_users"]:
-            return "lightning"
-        if (ctx["lightning_users"] >= 2 and not ctx["laser_users"]
-                and not ctx["mortar_users"]):
-            return "mortar"
-        if ctx["laser_users"] or ctx["mortar_users"]:
-            return "laser"
-        return None
-
-    def _safe_to_swap_weapon(self, me, thr, t):
-        """Only swap a special weapon during a genuinely quiet window."""
-        if t - self.last_dmg_t < 5.0:
-            return False
-        if me.get("hp", 0.0) < 0.70 * me.get("max_hp", 1400.0):
-            return False
-        for e in thr:
-            if e.get("sound"):
-                # Recent near/mid combat sounds make a detour too risky.
-                if e.get("d", 1e9) < 130.0:
-                    return False
-            elif e.get("d", 1e9) < 125.0:
-                return False
-            if not e.get("sound") and e.get("charging") and e.get("d", 1e9) < 190.0:
-                return False
-        return True
-
     # ------------------------------------------------------------------ main
     def act(self, obs):
         t0 = time.perf_counter()
@@ -381,7 +292,7 @@ class Bot:
 
         # ---- fight or flee ----
         hpf = me["hp"] / max(1.0, me["max_hp"])
-        ftgt = self._pick_target(vis, hot)
+        ftgt = self._pick_target(vis, hot, x, y)
         n_close = sum(1 for e in vis if e["d"] < 110.0)
         fight = (
             ftgt is not None and
@@ -543,28 +454,23 @@ class Bot:
 
     # ------------------------------------------------------------------ loot
     def _rush_pickup(self, obs, me, x, y, z, thr):
-        """Grab the best nearby special weapon before a distant hunter arrives."""
+        """Grab a nearby laser/lightning before a distant hunter makes contact."""
         if any(e["d"] < RUSH_COMMIT_ENEMY for e in thr if not e.get("sound")):
             return None
         slots = me["weapons"]
         if len(slots) < 2 or slots[1] is not None:
             return None
         have = {w["kind"] for w in slots if w}
-        values, _ctx = self._adaptive_weapon_values(thr, x, y)
-        best, best_score = None, -1.0
+        best, bd = None, 1e9
         for p in obs.get("pickups") or []:
-            kind = p.get("kind")
-            if kind not in ("laser", "lightning", "mortar") or kind in have:
-                continue
-            if p.get("id") in self.dead_loot:
+            k = p["kind"]
+            if k not in ("laser", "lightning") or k in have or p["id"] in self.dead_loot:
                 continue
             d = math.hypot(p["pos"][0] - x, p["pos"][1] - y)
             if d > RUSH_COMMIT_DIST or abs(p["pos"][2] - z) > 3.0:
                 continue
-            score = values[kind] / (8.0 + d)
-            if score > best_score:
-                best_score = score
-                best = {"id": p["id"], "pos": p["pos"], "is_weapon": True}
+            if d < bd:
+                bd, best = d, {"id": p["id"], "pos": p["pos"], "is_weapon": True}
         return best
 
     def _find_loot(self, obs, me, x, y, z, thr, zi=None, farm_ok=False):
@@ -573,41 +479,32 @@ class Bot:
             return None
         slots = me["weapons"]
         best, bs = None, 0.0
-        values, _ctx = self._adaptive_weapon_values(thr, x, y)
-
         if len(slots) > 1 and slots[1] is None:
             have = {w["kind"] for w in slots if w}
             for p in obs.get("pickups") or []:
-                kind = p.get("kind")
-                if (kind == "gun" or kind in have or p.get("id") in self.dead_loot
-                        or kind not in values):
+                k = p["kind"]
+                if k == "gun" or k in have or p["id"] in self.dead_loot or k not in LOOT_VALUE:
                     continue
                 d = math.hypot(p["pos"][0] - x, p["pos"][1] - y)
-                if d > LOOT_RANGE.get(kind, 0.0) or abs(p["pos"][2] - z) > 3.0:
+                if d > LOOT_RANGE[k] or abs(p["pos"][2] - z) > 3.0:
                     continue
-                score = values[kind] / (10.0 + d)
-                if score > bs:
-                    bs, best = score, {"id": p["id"], "pos": p["pos"], "is_weapon": True}
-
-        elif (SWAP_UP and len(slots) > 1 and slots[1] is not None
-              and slots[1].get("charge", 0.0) <= 0.0
-              and self._safe_to_swap_weapon(me, thr, obs.get("t", self.now))):
-            current_kind = slots[1].get("kind")
-            desired_kind = self._desired_special_weapon(thr, x, y)
-            if desired_kind and desired_kind != current_kind:
-                for p in obs.get("pickups") or []:
-                    if p.get("kind") != desired_kind or p.get("id") in self.dead_loot:
-                        continue
-                    d = math.hypot(p["pos"][0] - x, p["pos"][1] - y)
-                    if d > SWAP_RANGE or abs(p["pos"][2] - z) > 3.0:
-                        continue
-                    # A situational swap must be worthwhile, not just marginal.
-                    score = values[desired_kind] / (8.0 + d)
-                    if score > bs:
-                        bs = score
-                        best = {"id": p["id"], "pos": p["pos"],
-                                "is_weapon": True, "swap": 1}
-
+                sc = LOOT_VALUE[k] / (10.0 + d)
+                if sc > bs:
+                    bs, best = sc, {"id": p["id"], "pos": p["pos"], "is_weapon": True}
+        elif SWAP_UP and len(slots) > 1 and slots[1] is not None and slots[1]["kind"] in WEAPON_RANK \
+                and slots[1].get("charge", 0.0) <= 0.0:
+            mine = WEAPON_RANK[slots[1]["kind"]]
+            have = {w["kind"] for w in slots if w}
+            for p in obs.get("pickups") or []:
+                k = p["kind"]
+                if WEAPON_RANK.get(k, 0) <= mine or k in have or p["id"] in self.dead_loot:
+                    continue
+                d = math.hypot(p["pos"][0] - x, p["pos"][1] - y)
+                if d > SWAP_RANGE or abs(p["pos"][2] - z) > 3.0:
+                    continue
+                sc = WEAPON_RANK[k] / (10.0 + d)
+                if sc > bs:
+                    bs, best = sc, {"id": p["id"], "pos": p["pos"], "is_weapon": True, "swap": 1}
         if best is None and obs["t"] < 330:
             for c in obs.get("cubes") or []:
                 d = math.hypot(c["pos"][0] - x, c["pos"][1] - y)
@@ -781,7 +678,7 @@ class Bot:
             return self.hx, self.hy
         return best
 
-    def _pick_target(self, vis, hot):
+    def _pick_target(self, vis, hot, my_x=None, my_y=None):
         """Prefer accessible early kills; avoid long chases after healthy laser holders."""
         if not vis:
             self.focus_id = None
@@ -819,6 +716,16 @@ class Bot:
             elif e.get("charging") and d > 45.0:
                 # Do not run toward an out-of-range charge just to duel it.
                 cost += 100.0
+
+            # Prefer an otherwise comparable target whose torso is turned away.
+            # Rear hits deal 1.5x damage; require a 20-degree margin beyond the
+            # 90-degree front-arc boundary to avoid chasing noisy/temporary angles.
+            enemy_aim = m.get("aim")
+            if my_x is not None and my_y is not None and enemy_aim:
+                bearing_from_enemy = math.atan2(my_y - e["y"], my_x - e["x"])
+                facing_error = abs(wrap(bearing_from_enemy - enemy_aim[0]))
+                if facing_error >= math.radians(110.0):
+                    cost -= 130.0
 
             # A weakened carrier with cubes is a valuable kill/drop opportunity.
             carried_cubes = max(0, int(m.get("cubes", 0) or 0))
@@ -962,7 +869,7 @@ class Bot:
         fire = [False, False]
         reload = False
 
-        tgt = self._pick_target(vis, hot)
+        tgt = self._pick_target(vis, hot, x, y)
 
         want = False
         if tgt is not None:
