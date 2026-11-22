@@ -83,7 +83,7 @@ SNOWBALL_MIN_HP_FRACTION = 0.50
 
 
 class Bot:
-    name = "hunter-snowball-v14"
+    name = "snowball-v14a"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -124,8 +124,6 @@ class Bot:
         self.last_kill_t = -999.0
         self.last_kill_id = None
         self.last_kill_pos = None
-        self.sound_focus_bearing = None
-        self.sound_focus_until = -1.0
 
     # ------------------------------------------------------------------ helpers
     def _pick_upgrade(self, offer, hpf=1.0):
@@ -239,19 +237,6 @@ class Bot:
                 self.last_kill_pos = (
                     self.focus_pos if self.focus_id == self.last_kill_id else None
                 )
-        # A laser charge is audible within 140 m. When no mech is visible,
-        # briefly turn the vision wedge toward that bearing to acquire the shooter.
-        # This never fires blindly and does not change movement or target scoring.
-        for sound in obs.get("sounds") or []:
-            if (sound.get("kind") == "laser_charge" and
-                    sound.get("age", 99.0) < 0.9 and
-                    sound.get("dist") in ("near", "mid")):
-                age = max(0.0, float(sound.get("age", 0.0)))
-                until = t + max(0.1, 1.1 - age)
-                if until >= self.sound_focus_until:
-                    self.sound_focus_bearing = wrap(float(sound["bearing"]))
-                    self.sound_focus_until = until
-
         hot = (t - self.last_dmg_t) < 2.5
 
         zi = self._zone(obs, x, y)
@@ -721,8 +706,11 @@ class Bot:
 
             # During the opening, a healthy distant laser carrier is a poor chase.
             # This is only a proxy for threat/loadout, not a claim that we know bot difficulty.
-            if self.now < 210.0 and "laser" in weapons and hp > 700.0 and d > 65.0:
-                cost += 360.0
+            if self.now < 400.0 and "laser" in weapons and hp > 700.0 and d > 45.0:
+                cost += 700.0
+            # isolated targets are safer to kill: the squad shares vision, so friends nearby mean company soon
+            friends = sum(1 for o in vis if o is not e and math.hypot(o["x"] - e["x"], o["y"] - e["y"]) < 60.0)
+            cost += 140.0 * friends if friends else -60.0
 
             # If lightning can interrupt an active laser at close range, take that opportunity.
             if (e.get("charging") and d <= 42.0 and "lightning" in self.my_weapons
@@ -979,9 +967,6 @@ class Bot:
                 aim = [math.atan2(tgt["y"] - y, tgt["x"] - x), 0.0]
             elif hot and self.last_dmg_bearing is not None:
                 aim = [self.last_dmg_bearing, 0.0]
-            elif (self.sound_focus_bearing is not None and
-                  t <= self.sound_focus_until):
-                aim = [self.sound_focus_bearing, 0.0]
             elif thr and not thr[0].get("sound") and thr[0]["d"] < 160:
                 aim = [math.atan2(thr[0]["y"] - y, thr[0]["x"] - x), 0.0]
             elif math.hypot(*move) > 0.05:
