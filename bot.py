@@ -60,8 +60,8 @@ FARM_MAX_T = 300.0
 FARM_GIVEUP_S = 30.0
 
 WEAPON_RUSH = True
-RUSH_COMMIT_DIST = 30.0
-RUSH_COMMIT_ENEMY = 60.0
+RUSH_COMMIT_DIST = 55.0
+RUSH_COMMIT_ENEMY = 45.0
 
 # Laser is the default long-range pickup preference. Lightning remains useful
 # as a close-range laser-charge interrupt, not as a universal weapon upgrade.
@@ -73,7 +73,7 @@ SWAP_RANGE = 35.0
 WEAPON_RANK = {"mortar": 1, "laser": 2, "lightning": 3}
 OPENING_SPIN = False
 OPENING_S = 8.0
-LOOT_RANGE = {"laser": 120.0, "lightning": 100.0, "mortar": 70.0}
+LOOT_RANGE = {"laser": 170.0, "lightning": 150.0, "mortar": 70.0}
 
 # Snowballing: only sweep a victim's nearby drops briefly after a confirmed kill.
 SNOWBALL_KILL_WINDOW = 4.5
@@ -83,7 +83,7 @@ SNOWBALL_MIN_HP_FRACTION = 0.50
 
 
 class Bot:
-    name = "snowball-v14a"
+    name = "snowball-v14b"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -706,11 +706,8 @@ class Bot:
 
             # During the opening, a healthy distant laser carrier is a poor chase.
             # This is only a proxy for threat/loadout, not a claim that we know bot difficulty.
-            if self.now < 400.0 and "laser" in weapons and hp > 700.0 and d > 45.0:
-                cost += 700.0
-            # isolated targets are safer to kill: the squad shares vision, so friends nearby mean company soon
-            friends = sum(1 for o in vis if o is not e and math.hypot(o["x"] - e["x"], o["y"] - e["y"]) < 60.0)
-            cost += 140.0 * friends if friends else -60.0
+            if self.now < 210.0 and "laser" in weapons and hp > 700.0 and d > 65.0:
+                cost += 360.0
 
             # If lightning can interrupt an active laser at close range, take that opportunity.
             if (e.get("charging") and d <= 42.0 and "lightning" in self.my_weapons
